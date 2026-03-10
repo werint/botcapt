@@ -144,7 +144,7 @@ async def get_users_with_checkmark_from_target_role(channel):
     
     return list(message_authors)
 
-async def update_capt_list(message_id, auto_update=False, triggered_by=None):
+async def update_capt_list(message_id, auto_update=False):
     """Обновляет список пользователей в embed"""
     if message_id not in active_capts:
         return False
@@ -162,15 +162,6 @@ async def update_capt_list(message_id, auto_update=False, triggered_by=None):
         
         # Получаем ВСЕХ пользователей, на чьи сообщения поставили ✅ с целевой ролью
         users = await get_users_with_checkmark_from_target_role(channel)
-        
-        old_count = 0
-        if message.embeds:
-            old_description = message.embeds[0].description
-            if old_description and "Найдено пользователей:" in old_description:
-                try:
-                    old_count = int(old_description.split("Найдено пользователей:")[1].split("\n")[0].strip())
-                except:
-                    old_count = 0
         
         if users:
             # Сортируем пользователей по имени
@@ -230,33 +221,6 @@ async def update_capt_list(message_id, auto_update=False, triggered_by=None):
         # Увеличиваем счетчик обновлений
         capt.update_count += 1
         
-        # Логируем обновление
-        if auto_update:
-            # При автообновлении логируем только если изменилось количество
-            if len(users) != old_count:
-                await send_log(
-                    f"🔄 **Автообновление капта**\n"
-                    f"• Канал: {channel.mention}\n"
-                    f"• Сообщение: [ссылка]({message.jump_url})\n"
-                    f"• Пользователей: {old_count} → {len(users)}\n"
-                    f"• Обновление #{capt.update_count}",
-                    color=0x00ff00 if len(users) > old_count else 0xffaa00,
-                    title="📊 Изменение в капте"
-                )
-        else:
-            # При ручном обновлении логируем всегда
-            trigger_text = f"от {triggered_by.mention}" if triggered_by else "вручную"
-            await send_log(
-                f"👆 **Ручное обновление капта**\n"
-                f"• Канал: {channel.mention}\n"
-                f"• Сообщение: [ссылка]({message.jump_url})\n"
-                f"• Инициатор: {trigger_text}\n"
-                f"• Найдено пользователей: {len(users)}\n"
-                f"• Обновление #{capt.update_count}",
-                color=0x0099ff,
-                title="🔄 Ручное обновление"
-            )
-        
         return True
         
     except discord.NotFound:
@@ -287,24 +251,9 @@ async def start_auto_update(message_id):
                     await update_capt_list(message_id, auto_update=True)
         except asyncio.CancelledError:
             print(f"🛑 Автообновление капта {message_id} остановлено")
-            await send_log(
-                f"🛑 **Автообновление остановлено**\n"
-                f"• Канал: <#{capt.channel_id}>\n"
-                f"• Всего обновлений: {capt.update_count}",
-                color=0xffaa00,
-                title="⏸️ Автообновление остановлено"
-            )
     
     capt.auto_update_task = asyncio.create_task(auto_update_loop())
     print(f"🤖 Автообновление запущено для капта {message_id} (каждые {AUTO_UPDATE_INTERVAL} сек)")
-    await send_log(
-        f"🤖 **Автообновление запущено**\n"
-        f"• Канал: <#{capt.channel_id}>\n"
-        f"• Интервал: {AUTO_UPDATE_INTERVAL} сек\n"
-        f"• Создатель: <@{capt.creator_id}>",
-        color=0x00ff00,
-        title="▶️ Автообновление запущено"
-    )
 
 async def disable_capt(message_id):
     """Деактивирует капт через час"""
@@ -343,12 +292,11 @@ async def disable_capt(message_id):
             
             # Логируем деактивацию
             await send_log(
-                f"⏰ **Капт деактивирован**\n"
+                f"⏰ **Капт завершен**\n"
                 f"• Канал: {channel.mention}\n"
                 f"• Сообщение: [ссылка]({message.jump_url})\n"
                 f"• Создатель: <@{capt.creator_id}>\n"
-                f"• Всего обновлений: {capt.update_count}\n"
-                f"• Время жизни: 1 час",
+                f"• Всего обновлений: {capt.update_count}",
                 color=0x808080,
                 title="⏰ Капт завершен"
             )
@@ -435,23 +383,10 @@ async def capt_command(interaction: discord.Interaction):
         f"• Сообщение: [ссылка]({message.jump_url})\n"
         f"• Создатель: {interaction.user.mention}\n"
         f"• Условие: реакция {CHECKMARK_EMOJI} от <@&{TARGET_ROLE_ID}>\n"
-        f"• Автообновление: каждые {AUTO_UPDATE_INTERVAL} сек\n"
-        f"• Длительность: 1 час",
+        f"• Автообновление: каждые {AUTO_UPDATE_INTERVAL} сек",
         color=0x00ff00,
         title="📋 Новый капт"
     )
-    
-    # Отправляем подтверждение в личку
-    try:
-        await interaction.user.send(
-            f"✅ Капт создан в канале {interaction.channel.mention}!\n"
-            f"🔍 Условие: реакция {CHECKMARK_EMOJI} от <@&{TARGET_ROLE_ID}>\n"
-            f"📋 В список попадают ВСЕ пользователи, на чьи сообщения поставили ✅\n"
-            f"🔄 Автообновление каждые {AUTO_UPDATE_INTERVAL} секунд\n"
-            f"⏰ Активен 1 час"
-        )
-    except:
-        pass  # Если нельзя отправить в личку - игнорируем
 
 class CaptButton(discord.ui.Button):
     def __init__(self):
@@ -482,7 +417,7 @@ class CaptButton(discord.ui.Button):
                 )
                 
                 # Обновляем список (ручное обновление)
-                success = await update_capt_list(message_id, auto_update=False, triggered_by=interaction.user)
+                success = await update_capt_list(message_id)
                 
                 if success:
                     await interaction.followup.send("✅ Список обновлен!", ephemeral=True)
