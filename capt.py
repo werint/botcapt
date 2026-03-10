@@ -8,7 +8,7 @@ import os
 # Настройки бота
 TOKEN = os.getenv('DISCORD_TOKEN')
 TARGET_ROLE_ID = 1478205318591938671
-CHECKMARK_EMOJI = '✅'  # Или можно использовать ':white_check_mark:'
+CHECKMARK_EMOJI = '✅'
 ALLOWED_ROLES = [
     1310673963000528949,
     1223589384452833290, 
@@ -48,6 +48,7 @@ bot = CaptBot()
 async def on_ready():
     print(f'✅ Бот {bot.user} запущен!')
     print(f'Подключен к серверам: {len(bot.guilds)}')
+    cleanup_expired_capts.start()
 
 async def get_users_with_checkmark_reaction(channel):
     """Получает пользователей с ролью TARGET_ROLE_ID, которые поставили ✅ в указанном канале"""
@@ -66,7 +67,6 @@ async def get_users_with_checkmark_reaction(channel):
             
             # Ищем реакцию ✅
             for reaction in message.reactions:
-                # Проверяем эмодзи (поддерживает как стандартный ✅, так и кастомный :white_check_mark:)
                 if str(reaction.emoji) == CHECKMARK_EMOJI or reaction.emoji == '✅':
                     async for user in reaction.users():
                         if isinstance(user, discord.Member):
@@ -85,15 +85,15 @@ async def get_users_with_checkmark_reaction(channel):
 async def update_capt_list(message_id):
     """Обновляет список пользователей в embed"""
     if message_id not in active_capts:
-        return
+        return False
     
     capt = active_capts[message_id]
     if not capt.is_active:
-        return
+        return False
     
     channel = bot.get_channel(capt.channel_id)
     if not channel:
-        return
+        return False
     
     try:
         message = await channel.fetch_message(message_id)
@@ -113,11 +113,13 @@ async def update_capt_list(message_id):
                 description_parts.append(f"{i}. {user.mention}")
             
             description = '\n'.join(description_parts)
+            color = 0x00ff00  # Зеленый
         else:
             description = '❌ Пользователи с реакцией ✅ не найдены'
+            color = 0xff0000  # Красный
         
         embed = discord.Embed(
-            color=0x00ff00 if users else 0xff0000,  # Зеленый если есть пользователи, красный если нет
+            color=color,
             title='📋 Список на капт',
             description=description,
             timestamp=datetime.now()
@@ -150,13 +152,16 @@ async def update_capt_list(message_id):
         embed.set_footer(text=f"🔄 Обновляется по кнопке • {time_str}")
         
         await message.edit(embed=embed)
+        return True
         
     except discord.NotFound:
         print(f"❌ Сообщение {message_id} не найдено")
         if message_id in active_capts:
             del active_capts[message_id]
+        return False
     except Exception as e:
         print(f"Ошибка при обновлении капта {message_id}: {e}")
+        return False
 
 async def disable_capt(message_id):
     """Деактивирует капт через час"""
@@ -261,71 +266,91 @@ async def capt_command(interaction: discord.Interaction):
     
     capt.expire_task = asyncio.create_task(expire_loop())
     
-    await interaction.followup.send(
-        f"✅ Капт создан в канале {interaction.channel.mention}!\n"
-        f"🔍 Будет искать пользователей с ролью <@&{TARGET_ROLE_ID}> и реакцией {CHECKMARK_EMOJI}\n"
-        f"⏰ Активен 1 час",
-        ephemeral=True
-    )
+    # Отправляем подтверждение в личку
+    try:
+        await interaction.user.send(
+            f"✅ Капт создан в канале {interaction.channel.mention}!\n"
+            f"🔍 Будет искать пользователей с ролью <@&{TARGET_ROLE_ID}> и реакцией {CHECKMARK_EMOJI}\n"
+            f"⏰ Активен 1 час"
+        )
+    except:
+        pass  # Если нельзя отправить в личку - игнорируем
+
+class CaptButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="🔄 Обновить",
+            style=discord.ButtonStyle.primary,
+            custom_id="refresh_capt"
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        # Проверка прав
+        if not check_allowed_roles(interaction):
+            await interaction.response.send_message(
+                "❌ У вас нет прав на использование этой кнопки.", 
+                ephemeral=True
+            )
+            return
+        
+        message_id = interaction.message.id
+        
+        if message_id in active_capts:
+            capt = active_capts[message_id]
+            if capt.is_active:
+                # Отправляем начальное сообщение
+                await interaction.response.send_message(
+                    "🔍 Поиск пользователей с реакцией ✅...", 
+                    ephemeral=True
+                )
+                
+                # Обновляем список
+                success = await update_capt_list(message_id)
+                
+                if success:
+                    await interaction.followup.send("✅ Список обновлен!", ephemeral=True)
+                else:
+                    await interaction.followup.send("❌ Ошибка при обновлении списка.", ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    "❌ Срок действия этого капта истек.", 
+                    ephemeral=True
+                )
+        else:
+            # Проверяем, может быть капт уже истек, но сообщение осталось
+            try:
+                message = await interaction.message.fetch()
+                if message.embeds:
+                    embed = message.embeds[0]
+                    if embed.footer and "Срок действия истек" in embed.footer.text:
+                        await interaction.response.send_message(
+                            "❌ Срок действия этого капта истек.", 
+                            ephemeral=True
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            "❌ Капт не найден в активных. Возможно, бот был перезапущен.", 
+                            ephemeral=True
+                        )
+                else:
+                    await interaction.response.send_message(
+                        "❌ Капт не найден.", 
+                        ephemeral=True
+                    )
+            except:
+                await interaction.response.send_message(
+                    "❌ Капт не найден.", 
+                    ephemeral=True
+                )
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     """Обработка нажатий на кнопки"""
     if interaction.type == discord.InteractionType.component:
         if interaction.data["custom_id"] == "refresh_capt":
-            # Проверка прав
-            if not check_allowed_roles(interaction):
-                await interaction.response.send_message(
-                    "❌ У вас нет прав на использование этой кнопки.", 
-                    ephemeral=True
-                )
-                return
-            
-            message_id = interaction.message.id
-            
-            if message_id in active_capts:
-                capt = active_capts[message_id]
-                if capt.is_active:
-                    await interaction.response.defer(ephemeral=True)
-                    
-                    # Отправляем уведомление о начале поиска
-                    await interaction.followup.send("🔍 Поиск пользователей с реакцией ✅...", ephemeral=True)
-                    
-                    # Обновляем список
-                    await update_capt_list(message_id)
-                    
-                    await interaction.followup.send("✅ Список обновлен!", ephemeral=True)
-                else:
-                    await interaction.response.send_message(
-                        "❌ Срок действия этого капта истек.", 
-                        ephemeral=True
-                    )
-            else:
-                # Проверяем, может быть капт уже истек, но сообщение осталось
-                try:
-                    message = await interaction.message.fetch()
-                    if message.embeds:
-                        embed = message.embeds[0]
-                        if embed.footer and "Срок действия истек" in embed.footer.text:
-                            await interaction.response.send_message(
-                                "❌ Срок действия этого капта истек.", 
-                                ephemeral=True
-                            )
-                        else:
-                            await interaction.response.send_message(
-                                "❌ Капт не найден в активных. Возможно, бот был перезапущен.", 
-                                ephemeral=True
-                            )
-                    else:
-                        await interaction.response.send_message(
-                            "❌ Капт не найден.", 
-                            ephemeral=True
-                        )
-                except:
-                    await interaction.response.send_message(
-                        "❌ Капт не найден.", 
-                        ephemeral=True
-                    )
+            # Создаем и вызываем кнопку
+            button = CaptButton()
+            await button.callback(interaction)
 
 @tasks.loop(minutes=5)
 async def cleanup_expired_capts():
@@ -334,7 +359,7 @@ async def cleanup_expired_capts():
     expired = []
     
     for message_id, capt in active_capts.items():
-        if current_time - capt.created_at > timedelta(hours=1, minutes=10):  # +10 минут запас
+        if current_time - capt.created_at > timedelta(hours=1, minutes=10):
             expired.append(message_id)
     
     for message_id in expired:
@@ -346,7 +371,6 @@ async def cleanup_expired_capts():
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ Ошибка: Не найден DISCORD_TOKEN в переменных окружения")
-        print("Добавьте переменную окружения DISCORD_TOKEN в Railway")
         exit(1)
     
     try:
