@@ -7,7 +7,7 @@ import os
 
 # Настройки бота
 TOKEN = os.getenv('DISCORD_TOKEN')
-TARGET_ROLE_ID = 1478205318591938671
+TARGET_ROLE_ID = 1478205318591938671  # Роль, которая ставит реакции
 CHECKMARK_EMOJI = '✅'
 ALLOWED_ROLES = [
     1310673963000528949,
@@ -50,37 +50,52 @@ async def on_ready():
     print(f'Подключен к серверам: {len(bot.guilds)}')
     cleanup_expired_capts.start()
 
-async def get_users_with_checkmark_reaction(channel):
-    """Получает пользователей с ролью TARGET_ROLE_ID, которые поставили ✅ в указанном канале"""
+async def get_users_with_checkmark_from_target_role(channel):
+    """
+    Получает ВСЕХ пользователей, на чьих сообщениях есть реакция ✅,
+    которую поставил пользователь с ролью TARGET_ROLE_ID
+    """
     target_role = channel.guild.get_role(TARGET_ROLE_ID)
     if not target_role:
         print(f"⚠️ Роль {TARGET_ROLE_ID} не найдена на сервере {channel.guild.name}")
         return []
     
-    users_with_reactions = set()
+    # Множество для хранения уникальных пользователей (авторов сообщений)
+    message_authors = set()
     messages_checked = 0
+    reactions_checked = 0
     
     try:
         # Перебираем все сообщения в канале (до 1000 сообщений)
         async for message in channel.history(limit=1000):
             messages_checked += 1
             
-            # Ищем реакцию ✅
+            # Проверяем все реакции на сообщении
             for reaction in message.reactions:
+                # Проверяем, что это нужная реакция ✅
                 if str(reaction.emoji) == CHECKMARK_EMOJI or reaction.emoji == '✅':
+                    
+                    # Проверяем всех, кто поставил эту реакцию
                     async for user in reaction.users():
                         if isinstance(user, discord.Member):
+                            # Если пользователь, поставивший реакцию, имеет целевую роль
                             if target_role in user.roles:
-                                users_with_reactions.add(user)
+                                reactions_checked += 1
+                                # Добавляем АВТОРА сообщения в список
+                                if message.author and not message.author.bot:
+                                    message_authors.add(message.author)
+                                break  # Достаточно одной такой реакции на сообщении
         
-        print(f"📊 Проверено сообщений: {messages_checked}, найдено пользователей: {len(users_with_reactions)}")
+        print(f"📊 Проверено сообщений: {messages_checked}")
+        print(f"✅ Найдено реакций от целевой роли: {reactions_checked}")
+        print(f"👥 Уникальных авторов сообщений: {len(message_authors)}")
         
     except discord.Forbidden:
         print(f"❌ Нет доступа к каналу {channel.name}")
     except Exception as e:
         print(f"❌ Ошибка при обработке канала {channel.name}: {e}")
     
-    return list(users_with_reactions)
+    return list(message_authors)
 
 async def update_capt_list(message_id):
     """Обновляет список пользователей в embed"""
@@ -98,8 +113,8 @@ async def update_capt_list(message_id):
     try:
         message = await channel.fetch_message(message_id)
         
-        # Получаем пользователей с реакцией ✅ ТОЛЬКО в этом канале
-        users = await get_users_with_checkmark_reaction(channel)
+        # Получаем ВСЕХ пользователей, на чьи сообщения поставили ✅ с целевой ролью
+        users = await get_users_with_checkmark_from_target_role(channel)
         
         if users:
             # Сортируем пользователей по имени
@@ -115,7 +130,7 @@ async def update_capt_list(message_id):
             description = '\n'.join(description_parts)
             color = 0x00ff00  # Зеленый
         else:
-            description = '❌ Пользователи с реакцией ✅ не найдены'
+            description = '❌ Пользователи с реакцией ✅ от целевой роли не найдены'
             color = 0xff0000  # Красный
         
         embed = discord.Embed(
@@ -132,11 +147,11 @@ async def update_capt_list(message_id):
             inline=True
         )
         
-        # Добавляем информацию о реакции
+        # Добавляем информацию о реакции и роли
         embed.add_field(
-            name="✅ Реакция",
-            value=f"`{CHECKMARK_EMOJI}`",
-            inline=True
+            name="✅ Условие",
+            value=f"Реакция `{CHECKMARK_EMOJI}` от <@&{TARGET_ROLE_ID}>",
+            inline=False
         )
         
         # Добавляем информацию о времени
@@ -205,7 +220,7 @@ def check_allowed_roles(interaction: discord.Interaction) -> bool:
     user_roles = [role.id for role in interaction.user.roles]
     return any(role_id in user_roles for role_id in ALLOWED_ROLES)
 
-@bot.tree.command(name="capt", description="Создать список пользователей с реакцией ✅")
+@bot.tree.command(name="capt", description="Создать список пользователей с реакцией ✅ от целевой роли")
 async def capt_command(interaction: discord.Interaction):
     # Проверка прав
     if not check_allowed_roles(interaction):
@@ -220,24 +235,24 @@ async def capt_command(interaction: discord.Interaction):
     embed = discord.Embed(
         color=0x0099ff,
         title='📋 Список на капт',
-        description='🔍 Нажмите кнопку "Обновить" для поиска пользователей с реакцией ✅',
+        description='🔍 Нажмите кнопку "Обновить" для поиска пользователей',
         timestamp=datetime.now()
     )
     
-    # Добавляем информацию о канале и реакции
+    # Добавляем информацию о канале и условиях
     embed.add_field(
         name="📌 Канал",
         value=f"{interaction.channel.mention}",
         inline=True
     )
     embed.add_field(
-        name="✅ Реакция",
-        value=f"`{CHECKMARK_EMOJI}`",
-        inline=True
+        name="✅ Условие",
+        value=f"Реакция `{CHECKMARK_EMOJI}` от <@&{TARGET_ROLE_ID}>",
+        inline=False
     )
     embed.add_field(
-        name="👑 Требуемая роль",
-        value=f"<@&{TARGET_ROLE_ID}>",
+        name="📋 Результат",
+        value="Все пользователи, на чьи сообщения поставили ✅",
         inline=False
     )
     
@@ -270,7 +285,8 @@ async def capt_command(interaction: discord.Interaction):
     try:
         await interaction.user.send(
             f"✅ Капт создан в канале {interaction.channel.mention}!\n"
-            f"🔍 Будет искать пользователей с ролью <@&{TARGET_ROLE_ID}> и реакцией {CHECKMARK_EMOJI}\n"
+            f"🔍 Условие: реакция {CHECKMARK_EMOJI} от <@&{TARGET_ROLE_ID}>\n"
+            f"📋 В список попадают ВСЕ пользователи, на чьи сообщения поставили ✅\n"
             f"⏰ Активен 1 час"
         )
     except:
@@ -300,7 +316,7 @@ class CaptButton(discord.ui.Button):
             if capt.is_active:
                 # Отправляем начальное сообщение
                 await interaction.response.send_message(
-                    "🔍 Поиск пользователей с реакцией ✅...", 
+                    f"🔍 Поиск пользователей с реакцией {CHECKMARK_EMOJI} от <@&{TARGET_ROLE_ID}>...", 
                     ephemeral=True
                 )
                 
