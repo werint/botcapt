@@ -8,6 +8,7 @@ import os
 # Настройки бота
 TOKEN = os.getenv('DISCORD_TOKEN')
 TARGET_ROLE_ID = 1478205318591938671
+CHECKMARK_EMOJI = '✅'  # Или можно использовать ':white_check_mark:'
 ALLOWED_ROLES = [
     1310673963000528949,
     1223589384452833290, 
@@ -48,28 +49,36 @@ async def on_ready():
     print(f'✅ Бот {bot.user} запущен!')
     print(f'Подключен к серверам: {len(bot.guilds)}')
 
-async def get_users_with_reactions(guild):
-    """Получает пользователей с ролью TARGET_ROLE_ID, которые ставили реакции"""
-    target_role = guild.get_role(TARGET_ROLE_ID)
+async def get_users_with_checkmark_reaction(channel):
+    """Получает пользователей с ролью TARGET_ROLE_ID, которые поставили ✅ в указанном канале"""
+    target_role = channel.guild.get_role(TARGET_ROLE_ID)
     if not target_role:
-        print(f"⚠️ Роль {TARGET_ROLE_ID} не найдена на сервере {guild.name}")
+        print(f"⚠️ Роль {TARGET_ROLE_ID} не найдена на сервере {channel.guild.name}")
         return []
     
     users_with_reactions = set()
+    messages_checked = 0
     
-    for channel in guild.text_channels:
-        try:
-            async for message in channel.history(limit=200):
-                for reaction in message.reactions:
+    try:
+        # Перебираем все сообщения в канале (до 1000 сообщений)
+        async for message in channel.history(limit=1000):
+            messages_checked += 1
+            
+            # Ищем реакцию ✅
+            for reaction in message.reactions:
+                # Проверяем эмодзи (поддерживает как стандартный ✅, так и кастомный :white_check_mark:)
+                if str(reaction.emoji) == CHECKMARK_EMOJI or reaction.emoji == '✅':
                     async for user in reaction.users():
                         if isinstance(user, discord.Member):
                             if target_role in user.roles:
                                 users_with_reactions.add(user)
-        except discord.Forbidden:
-            continue
-        except Exception as e:
-            print(f"Ошибка при обработке канала {channel.name}: {e}")
-            continue
+        
+        print(f"📊 Проверено сообщений: {messages_checked}, найдено пользователей: {len(users_with_reactions)}")
+        
+    except discord.Forbidden:
+        print(f"❌ Нет доступа к каналу {channel.name}")
+    except Exception as e:
+        print(f"❌ Ошибка при обработке канала {channel.name}: {e}")
     
     return list(users_with_reactions)
 
@@ -89,24 +98,43 @@ async def update_capt_list(message_id):
     try:
         message = await channel.fetch_message(message_id)
         
-        # Получаем пользователей с реакциями
-        users = await get_users_with_reactions(message.guild)
+        # Получаем пользователей с реакцией ✅ ТОЛЬКО в этом канале
+        users = await get_users_with_checkmark_reaction(channel)
         
         if users:
             # Сортируем пользователей по имени
             users.sort(key=lambda x: x.display_name.lower())
-            mentions = '\n'.join([f"• {user.mention}" for user in users])
             
-            # Добавляем счетчик
-            description = f"**Найдено пользователей: {len(users)}**\n\n{mentions}"
+            # Создаем описание со списком пользователей
+            description_parts = [f"**Найдено пользователей: {len(users)}**\n"]
+            
+            # Добавляем пользователей с отступами
+            for i, user in enumerate(users, 1):
+                description_parts.append(f"{i}. {user.mention}")
+            
+            description = '\n'.join(description_parts)
         else:
-            description = '❌ Пользователи с реакциями не найдены'
+            description = '❌ Пользователи с реакцией ✅ не найдены'
         
         embed = discord.Embed(
-            color=0x0099ff,
+            color=0x00ff00 if users else 0xff0000,  # Зеленый если есть пользователи, красный если нет
             title='📋 Список на капт',
             description=description,
             timestamp=datetime.now()
+        )
+        
+        # Добавляем информацию о канале
+        embed.add_field(
+            name="📌 Канал",
+            value=f"{channel.mention}",
+            inline=True
+        )
+        
+        # Добавляем информацию о реакции
+        embed.add_field(
+            name="✅ Реакция",
+            value=f"`{CHECKMARK_EMOJI}`",
+            inline=True
         )
         
         # Добавляем информацию о времени
@@ -172,7 +200,7 @@ def check_allowed_roles(interaction: discord.Interaction) -> bool:
     user_roles = [role.id for role in interaction.user.roles]
     return any(role_id in user_roles for role_id in ALLOWED_ROLES)
 
-@bot.tree.command(name="capt", description="Создать список пользователей с реакциями")
+@bot.tree.command(name="capt", description="Создать список пользователей с реакцией ✅")
 async def capt_command(interaction: discord.Interaction):
     # Проверка прав
     if not check_allowed_roles(interaction):
@@ -187,10 +215,28 @@ async def capt_command(interaction: discord.Interaction):
     embed = discord.Embed(
         color=0x0099ff,
         title='📋 Список на капт',
-        description='🔍 Нажмите кнопку "Обновить" для загрузки списка',
+        description='🔍 Нажмите кнопку "Обновить" для поиска пользователей с реакцией ✅',
         timestamp=datetime.now()
     )
-    embed.set_footer(text="🔄 Обновляется по кнопке • 1 час")
+    
+    # Добавляем информацию о канале и реакции
+    embed.add_field(
+        name="📌 Канал",
+        value=f"{interaction.channel.mention}",
+        inline=True
+    )
+    embed.add_field(
+        name="✅ Реакция",
+        value=f"`{CHECKMARK_EMOJI}`",
+        inline=True
+    )
+    embed.add_field(
+        name="👑 Требуемая роль",
+        value=f"<@&{TARGET_ROLE_ID}>",
+        inline=False
+    )
+    
+    embed.set_footer(text="🔄 Обновляется по кнопке • Активен 1 час")
     
     # Создаем кнопку
     view = discord.ui.View(timeout=None)
@@ -216,8 +262,9 @@ async def capt_command(interaction: discord.Interaction):
     capt.expire_task = asyncio.create_task(expire_loop())
     
     await interaction.followup.send(
-        f"✅ Капт создан! Будет активен 1 час.\n"
-        f"ID: {message.id}",
+        f"✅ Капт создан в канале {interaction.channel.mention}!\n"
+        f"🔍 Будет искать пользователей с ролью <@&{TARGET_ROLE_ID}> и реакцией {CHECKMARK_EMOJI}\n"
+        f"⏰ Активен 1 час",
         ephemeral=True
     )
 
@@ -240,7 +287,13 @@ async def on_interaction(interaction: discord.Interaction):
                 capt = active_capts[message_id]
                 if capt.is_active:
                     await interaction.response.defer(ephemeral=True)
+                    
+                    # Отправляем уведомление о начале поиска
+                    await interaction.followup.send("🔍 Поиск пользователей с реакцией ✅...", ephemeral=True)
+                    
+                    # Обновляем список
                     await update_capt_list(message_id)
+                    
                     await interaction.followup.send("✅ Список обновлен!", ephemeral=True)
                 else:
                     await interaction.response.send_message(
@@ -253,7 +306,7 @@ async def on_interaction(interaction: discord.Interaction):
                     message = await interaction.message.fetch()
                     if message.embeds:
                         embed = message.embeds[0]
-                        if "Срок действия истек" in embed.footer.text:
+                        if embed.footer and "Срок действия истек" in embed.footer.text:
                             await interaction.response.send_message(
                                 "❌ Срок действия этого капта истек.", 
                                 ephemeral=True
@@ -288,12 +341,6 @@ async def cleanup_expired_capts():
         if message_id in active_capts:
             del active_capts[message_id]
             print(f"🧹 Очищен истекший капт {message_id} из памяти")
-
-@bot.event
-async def on_ready():
-    print(f'✅ Бот {bot.user} запущен!')
-    print(f'Подключен к серверам: {len(bot.guilds)}')
-    cleanup_expired_capts.start()
 
 # Запуск бота
 if __name__ == "__main__":
