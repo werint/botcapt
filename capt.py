@@ -4,6 +4,7 @@ from discord import app_commands
 import asyncio
 from datetime import datetime, timedelta
 import os
+import traceback
 
 # Настройки бота
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -15,17 +16,22 @@ ALLOWED_ROLES = [
     1381682246678741022,
     1478205318591938671
 ]
+LOG_CHANNEL_ID = 1448991378750046209  # Канал для логов
+AUTO_UPDATE_INTERVAL = 20  # секунд
 
 # Хранилище активных каптов
 active_capts = {}
 
 class CaptManager:
-    def __init__(self, message_id, channel_id):
+    def __init__(self, message_id, channel_id, creator_id):
         self.message_id = message_id
         self.channel_id = channel_id
+        self.creator_id = creator_id
         self.created_at = datetime.now()
         self.is_active = True
         self.expire_task = None
+        self.auto_update_task = None
+        self.update_count = 0  # Счетчик обновлений
 
 # Правильная настройка интентов
 intents = discord.Intents.default()
@@ -44,10 +50,51 @@ class CaptBot(commands.Bot):
 
 bot = CaptBot()
 
+async def get_log_channel():
+    """Получает канал для логов"""
+    channel = bot.get_channel(LOG_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+        except:
+            print(f"⚠️ Канал логов {LOG_CHANNEL_ID} не найден")
+            return None
+    return channel
+
+async def send_log(message: str, color: int = 0x0099ff, title: str = "📋 Лог"):
+    """Отправляет сообщение в канал логов"""
+    channel = await get_log_channel()
+    if not channel:
+        return
+    
+    embed = discord.Embed(
+        color=color,
+        title=title,
+        description=message,
+        timestamp=datetime.now()
+    )
+    
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"❌ Ошибка при отправке лога: {e}")
+
 @bot.event
 async def on_ready():
     print(f'✅ Бот {bot.user} запущен!')
     print(f'Подключен к серверам: {len(bot.guilds)}')
+    
+    # Отправляем лог о запуске
+    await send_log(
+        f"✅ **Бот запущен**\n"
+        f"• Пользователь: {bot.user} (ID: {bot.user.id})\n"
+        f"• Серверов: {len(bot.guilds)}\n"
+        f"• Автообновление: каждые {AUTO_UPDATE_INTERVAL} сек\n"
+        f"• Канал логов: <#{LOG_CHANNEL_ID}>",
+        color=0x00ff00,
+        title="🚀 Бот запущен"
+    )
+    
     cleanup_expired_capts.start()
 
 async def get_users_with_checkmark_from_target_role(channel):
@@ -97,7 +144,7 @@ async def get_users_with_checkmark_from_target_role(channel):
     
     return list(message_authors)
 
-async def update_capt_list(message_id):
+async def update_capt_list(message_id, auto_update=False, triggered_by=None):
     """Обновляет список пользователей в embed"""
     if message_id not in active_capts:
         return False
@@ -115,6 +162,15 @@ async def update_capt_list(message_id):
         
         # Получаем ВСЕХ пользователей, на чьи сообщения поставили ✅ с целевой ролью
         users = await get_users_with_checkmark_from_target_role(channel)
+        
+        old_count = 0
+        if message.embeds:
+            old_description = message.embeds[0].description
+            if old_description and "Найдено пользователей:" in old_description:
+                try:
+                    old_count = int(old_description.split("Найдено пользователей:")[1].split("\n")[0].strip())
+                except:
+                    old_count = 0
         
         if users:
             # Сортируем пользователей по имени
@@ -154,7 +210,7 @@ async def update_capt_list(message_id):
             inline=False
         )
         
-        # Добавляем информацию о времени
+        # Добавляем информацию о времени и автообновлении
         time_left = timedelta(hours=1) - (datetime.now() - capt.created_at)
         minutes_left = int(time_left.total_seconds() / 60)
         seconds_left = int(time_left.total_seconds() % 60)
@@ -163,20 +219,92 @@ async def update_capt_list(message_id):
             time_str = f"Осталось {minutes_left} мин {seconds_left} сек"
         else:
             time_str = f"Осталось {seconds_left} сек"
+        
+        # Добавляем информацию об автообновлении
+        auto_update_status = f"🔄 Автообновление ({capt.update_count})" if capt.auto_update_task else "⏸️ Автообновление остановлено"
             
-        embed.set_footer(text=f"🔄 Обновляется по кнопке • {time_str}")
+        embed.set_footer(text=f"{auto_update_status} • {time_str}")
         
         await message.edit(embed=embed)
+        
+        # Увеличиваем счетчик обновлений
+        capt.update_count += 1
+        
+        # Логируем обновление
+        if auto_update:
+            # При автообновлении логируем только если изменилось количество
+            if len(users) != old_count:
+                await send_log(
+                    f"🔄 **Автообновление капта**\n"
+                    f"• Канал: {channel.mention}\n"
+                    f"• Сообщение: [ссылка]({message.jump_url})\n"
+                    f"• Пользователей: {old_count} → {len(users)}\n"
+                    f"• Обновление #{capt.update_count}",
+                    color=0x00ff00 if len(users) > old_count else 0xffaa00,
+                    title="📊 Изменение в капте"
+                )
+        else:
+            # При ручном обновлении логируем всегда
+            trigger_text = f"от {triggered_by.mention}" if triggered_by else "вручную"
+            await send_log(
+                f"👆 **Ручное обновление капта**\n"
+                f"• Канал: {channel.mention}\n"
+                f"• Сообщение: [ссылка]({message.jump_url})\n"
+                f"• Инициатор: {trigger_text}\n"
+                f"• Найдено пользователей: {len(users)}\n"
+                f"• Обновление #{capt.update_count}",
+                color=0x0099ff,
+                title="🔄 Ручное обновление"
+            )
+        
         return True
         
     except discord.NotFound:
-        print(f"❌ Сообщение {message_id} не найдено")
+        error_msg = f"❌ Сообщение {message_id} не найдено"
+        print(error_msg)
+        await send_log(error_msg, color=0xff0000, title="❌ Ошибка")
         if message_id in active_capts:
             del active_capts[message_id]
         return False
     except Exception as e:
-        print(f"Ошибка при обновлении капта {message_id}: {e}")
+        error_msg = f"❌ Ошибка при обновлении капта {message_id}: {e}\n```{traceback.format_exc()}```"
+        print(error_msg)
+        await send_log(error_msg[:1000], color=0xff0000, title="❌ Ошибка обновления")
         return False
+
+async def start_auto_update(message_id):
+    """Запускает автоматическое обновление капта"""
+    if message_id not in active_capts:
+        return
+    
+    capt = active_capts[message_id]
+    
+    async def auto_update_loop():
+        try:
+            while capt.is_active:
+                await asyncio.sleep(AUTO_UPDATE_INTERVAL)
+                if capt.is_active:
+                    await update_capt_list(message_id, auto_update=True)
+        except asyncio.CancelledError:
+            print(f"🛑 Автообновление капта {message_id} остановлено")
+            await send_log(
+                f"🛑 **Автообновление остановлено**\n"
+                f"• Канал: <#{capt.channel_id}>\n"
+                f"• Всего обновлений: {capt.update_count}",
+                color=0xffaa00,
+                title="⏸️ Автообновление остановлено"
+            )
+    
+    capt.auto_update_task = asyncio.create_task(auto_update_loop())
+    print(f"🤖 Автообновление запущено для капта {message_id} (каждые {AUTO_UPDATE_INTERVAL} сек)")
+    await send_log(
+        f"🤖 **Автообновление запущено**\n"
+        f"• Канал: <#{capt.channel_id}>\n"
+        f"• Интервал: {AUTO_UPDATE_INTERVAL} сек\n"
+        f"• Создатель: <@{capt.creator_id}>",
+        color=0x00ff00,
+        title="▶️ Автообновление запущено"
+    )
 
 async def disable_capt(message_id):
     """Деактивирует капт через час"""
@@ -185,6 +313,10 @@ async def disable_capt(message_id):
     
     capt = active_capts[message_id]
     capt.is_active = False
+    
+    # Останавливаем автообновление
+    if capt.auto_update_task:
+        capt.auto_update_task.cancel()
     
     channel = bot.get_channel(capt.channel_id)
     if channel:
@@ -208,6 +340,18 @@ async def disable_capt(message_id):
             
             await message.edit(embed=embed, view=view)
             print(f"✅ Капт {message_id} деактивирован")
+            
+            # Логируем деактивацию
+            await send_log(
+                f"⏰ **Капт деактивирован**\n"
+                f"• Канал: {channel.mention}\n"
+                f"• Сообщение: [ссылка]({message.jump_url})\n"
+                f"• Создатель: <@{capt.creator_id}>\n"
+                f"• Всего обновлений: {capt.update_count}\n"
+                f"• Время жизни: 1 час",
+                color=0x808080,
+                title="⏰ Капт завершен"
+            )
             
         except Exception as e:
             print(f"Ошибка при деактивации капта: {e}")
@@ -256,7 +400,7 @@ async def capt_command(interaction: discord.Interaction):
         inline=False
     )
     
-    embed.set_footer(text="🔄 Обновляется по кнопке • Активен 1 час")
+    embed.set_footer(text=f"🔄 Автообновление каждые {AUTO_UPDATE_INTERVAL} сек • Активен 1 час")
     
     # Создаем кнопку
     view = discord.ui.View(timeout=None)
@@ -271,8 +415,11 @@ async def capt_command(interaction: discord.Interaction):
     message = await interaction.original_response()
     
     # Создаем менеджер капта
-    capt = CaptManager(message.id, interaction.channel_id)
+    capt = CaptManager(message.id, interaction.channel_id, interaction.user.id)
     active_capts[message.id] = capt
+    
+    # Запускаем автообновление
+    await start_auto_update(message.id)
     
     # Запускаем задачу истечения
     async def expire_loop():
@@ -281,12 +428,26 @@ async def capt_command(interaction: discord.Interaction):
     
     capt.expire_task = asyncio.create_task(expire_loop())
     
+    # Логируем создание капта
+    await send_log(
+        f"✅ **Новый капт создан**\n"
+        f"• Канал: {interaction.channel.mention}\n"
+        f"• Сообщение: [ссылка]({message.jump_url})\n"
+        f"• Создатель: {interaction.user.mention}\n"
+        f"• Условие: реакция {CHECKMARK_EMOJI} от <@&{TARGET_ROLE_ID}>\n"
+        f"• Автообновление: каждые {AUTO_UPDATE_INTERVAL} сек\n"
+        f"• Длительность: 1 час",
+        color=0x00ff00,
+        title="📋 Новый капт"
+    )
+    
     # Отправляем подтверждение в личку
     try:
         await interaction.user.send(
             f"✅ Капт создан в канале {interaction.channel.mention}!\n"
             f"🔍 Условие: реакция {CHECKMARK_EMOJI} от <@&{TARGET_ROLE_ID}>\n"
             f"📋 В список попадают ВСЕ пользователи, на чьи сообщения поставили ✅\n"
+            f"🔄 Автообновление каждые {AUTO_UPDATE_INTERVAL} секунд\n"
             f"⏰ Активен 1 час"
         )
     except:
@@ -320,8 +481,8 @@ class CaptButton(discord.ui.Button):
                     ephemeral=True
                 )
                 
-                # Обновляем список
-                success = await update_capt_list(message_id)
+                # Обновляем список (ручное обновление)
+                success = await update_capt_list(message_id, auto_update=False, triggered_by=interaction.user)
                 
                 if success:
                     await interaction.followup.send("✅ Список обновлен!", ephemeral=True)
@@ -380,8 +541,19 @@ async def cleanup_expired_capts():
     
     for message_id in expired:
         if message_id in active_capts:
+            # Останавливаем автообновление
+            if active_capts[message_id].auto_update_task:
+                active_capts[message_id].auto_update_task.cancel()
             del active_capts[message_id]
             print(f"🧹 Очищен истекший капт {message_id} из памяти")
+    
+    if expired:
+        await send_log(
+            f"🧹 **Очистка памяти**\n"
+            f"• Удалено истекших каптов: {len(expired)}",
+            color=0x808080,
+            title="🧹 Очистка"
+        )
 
 # Запуск бота
 if __name__ == "__main__":
