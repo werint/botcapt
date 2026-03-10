@@ -24,15 +24,14 @@ class CaptManager:
         self.channel_id = channel_id
         self.created_at = datetime.now()
         self.is_active = True
-        self.update_task = None
         self.expire_task = None
 
 # Правильная настройка интентов
 intents = discord.Intents.default()
-intents.message_content = True  # Для чтения сообщений
-intents.guilds = True           # Для работы с серверами
-intents.members = True          # Для получения информации об участниках
-intents.reactions = True        # 👈 ПРАВИЛЬНОЕ название для работы с реакциями
+intents.message_content = True
+intents.guilds = True
+intents.members = True
+intents.reactions = True
 
 class CaptBot(commands.Bot):
     def __init__(self):
@@ -48,23 +47,6 @@ bot = CaptBot()
 async def on_ready():
     print(f'✅ Бот {bot.user} запущен!')
     print(f'Подключен к серверам: {len(bot.guilds)}')
-    # Запускаем проверку истекших каптов
-    check_expired_capts.start()
-
-@tasks.loop(seconds=30)
-async def check_expired_capts():
-    """Проверяет истекшие капты каждые 30 секунд"""
-    current_time = datetime.now()
-    expired = []
-    
-    for message_id, capt in active_capts.items():
-        if current_time - capt.created_at > timedelta(hours=1):
-            expired.append(message_id)
-            await disable_capt(capt.message_id)
-    
-    for message_id in expired:
-        if message_id in active_capts:
-            del active_capts[message_id]
 
 async def get_users_with_reactions(guild):
     """Получает пользователей с ролью TARGET_ROLE_ID, которые ставили реакции"""
@@ -77,14 +59,13 @@ async def get_users_with_reactions(guild):
     
     for channel in guild.text_channels:
         try:
-            async for message in channel.history(limit=200):  # Увеличил лимит
+            async for message in channel.history(limit=200):
                 for reaction in message.reactions:
                     async for user in reaction.users():
                         if isinstance(user, discord.Member):
                             if target_role in user.roles:
                                 users_with_reactions.add(user)
         except discord.Forbidden:
-            # Нет доступа к каналу
             continue
         except Exception as e:
             print(f"Ошибка при обработке канала {channel.name}: {e}")
@@ -117,14 +98,13 @@ async def update_capt_list(message_id):
             mentions = '\n'.join([f"• {user.mention}" for user in users])
             
             # Добавляем счетчик
-            header = f"**Найдено пользователей: {len(users)}**\n\n"
-            description = header + mentions
+            description = f"**Найдено пользователей: {len(users)}**\n\n{mentions}"
         else:
             description = '❌ Пользователи с реакциями не найдены'
         
         embed = discord.Embed(
             color=0x0099ff,
-            title='📋 Список на капт И НИЧЕГО БОЛЬШЕ',
+            title='📋 Список на капт',
             description=description,
             timestamp=datetime.now()
         )
@@ -139,7 +119,7 @@ async def update_capt_list(message_id):
         else:
             time_str = f"Осталось {seconds_left} сек"
             
-        embed.set_footer(text=f"🔄 Обновляется каждые 10 сек • {time_str}")
+        embed.set_footer(text=f"🔄 Обновляется по кнопке • {time_str}")
         
         await message.edit(embed=embed)
         
@@ -158,9 +138,6 @@ async def disable_capt(message_id):
     capt = active_capts[message_id]
     capt.is_active = False
     
-    if capt.update_task:
-        capt.update_task.cancel()
-    
     channel = bot.get_channel(capt.channel_id)
     if channel:
         try:
@@ -169,7 +146,7 @@ async def disable_capt(message_id):
             # Обновляем embed с пометкой об истечении
             embed = message.embeds[0]
             embed.color = 0x808080
-            embed.set_footer(text="⏰ Срок действия истек • Капт больше не обновляется")
+            embed.set_footer(text="⏰ Срок действия истек")
             
             # Деактивируем кнопку
             view = discord.ui.View(timeout=None)
@@ -186,10 +163,12 @@ async def disable_capt(message_id):
             
         except Exception as e:
             print(f"Ошибка при деактивации капта: {e}")
+    
+    if message_id in active_capts:
+        del active_capts[message_id]
 
 def check_allowed_roles(interaction: discord.Interaction) -> bool:
     """Проверяет наличие разрешенных ролей у пользователя"""
-    # Проверяем, есть ли у пользователя хотя бы одна из разрешенных ролей
     user_roles = [role.id for role in interaction.user.roles]
     return any(role_id in user_roles for role_id in ALLOWED_ROLES)
 
@@ -207,11 +186,11 @@ async def capt_command(interaction: discord.Interaction):
     # Создаем embed
     embed = discord.Embed(
         color=0x0099ff,
-        title='📋 Список на капт И НИЧЕГО БОЛЬШЕ',
-        description='🔍 Загрузка участников...',
+        title='📋 Список на капт',
+        description='🔍 Нажмите кнопку "Обновить" для загрузки списка',
         timestamp=datetime.now()
     )
-    embed.set_footer(text="🔄 Обновляется каждые 10 сек")
+    embed.set_footer(text="🔄 Обновляется по кнопке • 1 час")
     
     # Создаем кнопку
     view = discord.ui.View(timeout=None)
@@ -229,30 +208,15 @@ async def capt_command(interaction: discord.Interaction):
     capt = CaptManager(message.id, interaction.channel_id)
     active_capts[message.id] = capt
     
-    # Запускаем задачи обновления
-    async def update_loop():
-        try:
-            while True:
-                if not capt.is_active:
-                    break
-                await update_capt_list(message.id)
-                await asyncio.sleep(10)
-        except asyncio.CancelledError:
-            pass
-    
-    capt.update_task = asyncio.create_task(update_loop())
-    
     # Запускаем задачу истечения
     async def expire_loop():
         await asyncio.sleep(3600)  # 1 час
         await disable_capt(message.id)
-        if message.id in active_capts:
-            del active_capts[message.id]
     
     capt.expire_task = asyncio.create_task(expire_loop())
     
     await interaction.followup.send(
-        f"✅ Капт создан! Будет обновляться 1 час.\n"
+        f"✅ Капт создан! Будет активен 1 час.\n"
         f"ID: {message.id}",
         ephemeral=True
     )
@@ -277,18 +241,59 @@ async def on_interaction(interaction: discord.Interaction):
                 if capt.is_active:
                     await interaction.response.defer(ephemeral=True)
                     await update_capt_list(message_id)
-                    await interaction.followup.send("✅ Список принудительно обновлен!", ephemeral=True)
+                    await interaction.followup.send("✅ Список обновлен!", ephemeral=True)
                 else:
                     await interaction.response.send_message(
                         "❌ Срок действия этого капта истек.", 
                         ephemeral=True
                     )
             else:
-                await interaction.response.send_message(
-                    "❌ Капт не найден или уже неактивен.\n"
-                    "Возможно, бот был перезапущен.", 
-                    ephemeral=True
-                )
+                # Проверяем, может быть капт уже истек, но сообщение осталось
+                try:
+                    message = await interaction.message.fetch()
+                    if message.embeds:
+                        embed = message.embeds[0]
+                        if "Срок действия истек" in embed.footer.text:
+                            await interaction.response.send_message(
+                                "❌ Срок действия этого капта истек.", 
+                                ephemeral=True
+                            )
+                        else:
+                            await interaction.response.send_message(
+                                "❌ Капт не найден в активных. Возможно, бот был перезапущен.", 
+                                ephemeral=True
+                            )
+                    else:
+                        await interaction.response.send_message(
+                            "❌ Капт не найден.", 
+                            ephemeral=True
+                        )
+                except:
+                    await interaction.response.send_message(
+                        "❌ Капт не найден.", 
+                        ephemeral=True
+                    )
+
+@tasks.loop(minutes=5)
+async def cleanup_expired_capts():
+    """Очистка истекших каптов из памяти"""
+    current_time = datetime.now()
+    expired = []
+    
+    for message_id, capt in active_capts.items():
+        if current_time - capt.created_at > timedelta(hours=1, minutes=10):  # +10 минут запас
+            expired.append(message_id)
+    
+    for message_id in expired:
+        if message_id in active_capts:
+            del active_capts[message_id]
+            print(f"🧹 Очищен истекший капт {message_id} из памяти")
+
+@bot.event
+async def on_ready():
+    print(f'✅ Бот {bot.user} запущен!')
+    print(f'Подключен к серверам: {len(bot.guilds)}')
+    cleanup_expired_capts.start()
 
 # Запуск бота
 if __name__ == "__main__":
