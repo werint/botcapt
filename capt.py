@@ -23,15 +23,16 @@ class CaptManager:
         self.creator_id = creator_id
         self.created_at = datetime.now()
         self.is_active = True
-        self.title_text = title_text  # То что написал пользователь в команде
+        self.title_text = title_text
         self.need_screenshot = need_screenshot
-        self.screenshot_url = None  # URL скриншота
+        self.screenshot_url = None
         self.screenshot_user = None
         self.screenshot_wait_task = None
-        self.registered_users = []  # Список зарегистрированных пользователей
-        self.plus_users = []  # Список пользователей, кто поставил плюс
+        self.registered_users = []
+        self.plus_users = []
         self.update_count = 0
-        self.message_sent = False  # Флаг что сообщение отправлено
+        self.message_sent = False
+        self.wait_message_id = None  # ID сообщения ожидания скриншота
 
 # Правильная настройка интентов
 intents = discord.Intents.default()
@@ -242,29 +243,24 @@ async def send_capt_message(channel, capt):
     
     return message
 
-async def start_screenshot_wait(message_id, interaction):
-    """Запускает ожидание скриншота"""
-    if message_id not in active_capts:
-        return
-    
-    capt = active_capts[message_id]
-    
-    # Отправляем сообщение с просьбой прислать скриншот
+async def start_screenshot_wait(capt, interaction):
+    """Запускает ожидание скриншота с отправкой в ephemeral сообщение"""
+    # Отправляем ephemeral сообщение с просьбой прислать скриншот
     embed = discord.Embed(
         color=0xffaa00,
         title="📸 Ожидание скриншота",
-        description=f"<@&{ALLOWED_CREATOR_ROLE}>, пожалуйста, отправьте скриншот в этот канал.\n\n"
+        description=f"Пожалуйста, отправьте скриншот в этот канал.\n\n"
                     f"**Текст капта:** {capt.title_text}\n"
                     f"⏰ Время ожидания: 5 минут",
         timestamp=datetime.now()
     )
     
-    wait_message = await interaction.channel.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
     
-    # Функция для проверки сообщений
+    # Функция для проверки сообщений от пользователя с нужной ролью
     def check(msg):
         return (msg.author.id == interaction.user.id and 
-                msg.channel.id == interaction.channel.id and
+                msg.channel.id == interaction.channel_id and
                 msg.attachments and 
                 any(att.content_type and att.content_type.startswith('image/') for att in msg.attachments))
     
@@ -276,8 +272,8 @@ async def start_screenshot_wait(message_id, interaction):
         capt.screenshot_url = screenshot_msg.attachments[0].url
         capt.screenshot_user = screenshot_msg.author
         
-        # Удаляем сообщение с ожиданием
-        await wait_message.delete()
+        # Удаляем сообщение пользователя со скриншотом
+        await screenshot_msg.delete()
         
         # Отправляем финальное сообщение
         await send_capt_message(interaction.channel, capt)
@@ -300,7 +296,6 @@ async def start_screenshot_wait(message_id, interaction):
         
     except asyncio.TimeoutError:
         # Время вышло, отправляем без скриншота
-        await wait_message.delete()
         await send_capt_message(interaction.channel, capt)
         
         await send_log(
@@ -403,21 +398,19 @@ async def capt_command(interaction: discord.Interaction, text: str):
         
         # Создаем капт с ожиданием скриншота
         capt = CaptManager(
-            message_id=0,  # Временный ID, будет обновлен позже
+            message_id=0,
             channel_id=interaction_btn.channel_id,
             creator_id=interaction_btn.user.id,
             title_text=text,
             need_screenshot=True
         )
         
-        # Сохраняем временно
-        temp_id = id(capt)
-        active_capts[temp_id] = capt
-        
-        await interaction_btn.followup.send("✅ Скриншот будет ожидаться 5 минут. Пожалуйста, отправьте скриншот в этот канал.", ephemeral=True)
+        # Сохраняем временно с уникальным ключом (используем объект)
+        temp_key = id(capt)
+        active_capts[temp_key] = capt
         
         # Запускаем ожидание скриншота
-        await start_screenshot_wait(temp_id, interaction_btn)
+        await start_screenshot_wait(capt, interaction_btn)
     
     async def no_callback(interaction_btn: discord.Interaction):
         await interaction_btn.response.defer(ephemeral=True)
@@ -511,7 +504,13 @@ async def on_interaction(interaction: discord.Interaction):
         
         # Обработка удаления плюсов
         elif custom_id.startswith("remove_plus_"):
-            message_id = int(custom_id.split("_")[2])
+            # Формат: remove_plus_{message_id}
+            parts = custom_id.split("_")
+            if len(parts) >= 3:
+                message_id = int(parts[2])
+            else:
+                await interaction.response.send_message("❌ Ошибка формата кнопки", ephemeral=True)
+                return
             
             if message_id not in active_capts:
                 await interaction.response.send_message("❌ Капт не найден", ephemeral=True)
@@ -611,6 +610,9 @@ async def list_capts(interaction: discord.Interaction):
     )
     
     for message_id, capt in active_capts.items():
+        if capt.message_id == 0:  # Пропускаем временные капты
+            continue
+            
         time_left = timedelta(hours=1) - (datetime.now() - capt.created_at)
         minutes_left = int(time_left.total_seconds() / 60)
         
