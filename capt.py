@@ -32,7 +32,7 @@ class CaptManager:
         self.plus_users = []
         self.update_count = 0
         self.message_sent = False
-        self.wait_message_id = None  # ID сообщения ожидания скриншота
+        self.wait_message_id = None
 
 # Правильная настройка интентов
 intents = discord.Intents.default()
@@ -105,6 +105,7 @@ def check_register_role(interaction: discord.Interaction) -> bool:
 async def update_capt_embed(message_id):
     """Обновляет embed с текущими списками"""
     if message_id not in active_capts:
+        print(f"❌ Капт {message_id} не найден в active_capts")
         return False
     
     capt = active_capts[message_id]
@@ -182,6 +183,7 @@ async def update_capt_embed(message_id):
         
     except Exception as e:
         print(f"Ошибка при обновлении капта {message_id}: {e}")
+        traceback.print_exc()
         return False
 
 async def send_capt_message(channel, capt):
@@ -238,8 +240,14 @@ async def send_capt_message(channel, capt):
     view.add_item(remove_plus_button)
     
     message = await channel.send(embed=embed, view=view)
+    old_message_id = capt.message_id
     capt.message_id = message.id
     capt.message_sent = True
+    
+    # Если был старый временный ID, удаляем его из active_capts и добавляем новый
+    if old_message_id != message.id and old_message_id in active_capts:
+        del active_capts[old_message_id]
+        active_capts[message.id] = capt
     
     return message
 
@@ -405,7 +413,7 @@ async def capt_command(interaction: discord.Interaction, text: str):
             need_screenshot=True
         )
         
-        # Сохраняем временно с уникальным ключом (используем объект)
+        # Сохраняем с временным ключом (используем временный ID)
         temp_key = id(capt)
         active_capts[temp_key] = capt
         
@@ -426,9 +434,6 @@ async def capt_command(interaction: discord.Interaction, text: str):
         
         # Отправляем сообщение с @everyone и embed
         await send_capt_message(interaction_btn.channel, capt)
-        
-        # Сохраняем в активные
-        active_capts[capt.message_id] = capt
         
         # Запускаем задачу истечения через час
         async def expire_loop():
@@ -466,11 +471,16 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.component:
         custom_id = interaction.data["custom_id"]
         
+        print(f"🔍 Получен interaction: {custom_id}")  # Для отладки
+        
         # Обработка плюсов
         if custom_id.startswith("plus_"):
             message_id = int(custom_id.split("_")[1])
+            print(f"➕ Обработка плюса для сообщения {message_id}")
             
             if message_id not in active_capts:
+                print(f"❌ Капт {message_id} не найден в active_capts")
+                print(f"Доступные ключи: {list(active_capts.keys())}")
                 await interaction.response.send_message("❌ Капт не найден", ephemeral=True)
                 return
             
@@ -504,15 +514,12 @@ async def on_interaction(interaction: discord.Interaction):
         
         # Обработка удаления плюсов
         elif custom_id.startswith("remove_plus_"):
-            # Формат: remove_plus_{message_id}
-            parts = custom_id.split("_")
-            if len(parts) >= 3:
-                message_id = int(parts[2])
-            else:
-                await interaction.response.send_message("❌ Ошибка формата кнопки", ephemeral=True)
-                return
+            message_id = int(custom_id.split("_")[2])
+            print(f"➖ Обработка удаления плюса для сообщения {message_id}")
             
             if message_id not in active_capts:
+                print(f"❌ Капт {message_id} не найден в active_capts")
+                print(f"Доступные ключи: {list(active_capts.keys())}")
                 await interaction.response.send_message("❌ Капт не найден", ephemeral=True)
                 return
             
