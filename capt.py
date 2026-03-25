@@ -17,20 +17,21 @@ SCREENSHOT_WAIT_TIME = 300  # 5 минут ожидания скриншота
 active_capts = {}
 
 class CaptManager:
-    def __init__(self, message_id, channel_id, creator_id, text, need_screenshot):
+    def __init__(self, message_id, channel_id, creator_id, title_text, need_screenshot):
         self.message_id = message_id
         self.channel_id = channel_id
         self.creator_id = creator_id
         self.created_at = datetime.now()
         self.is_active = True
-        self.text = text
+        self.title_text = title_text  # То что написал пользователь в команде
         self.need_screenshot = need_screenshot
-        self.screenshot_provided = False
+        self.screenshot_url = None  # URL скриншота
         self.screenshot_user = None
         self.screenshot_wait_task = None
-        self.registered_users = []  # Список зарегистрированных пользователей (кто в левой колонке)
+        self.registered_users = []  # Список зарегистрированных пользователей
         self.plus_users = []  # Список пользователей, кто поставил плюс
         self.update_count = 0
+        self.message_sent = False  # Флаг что сообщение отправлено
 
 # Правильная настройка интентов
 intents = discord.Intents.default()
@@ -134,12 +135,16 @@ async def update_capt_embed(message_id):
         
         embed = discord.Embed(
             color=0x0099ff,
-            title=f"📋 Капт",
+            title=f"📋 {capt.title_text}",
             timestamp=datetime.now()
         )
         
         embed.add_field(name="📝 Регнутые игроки", value=registered_text, inline=True)
         embed.add_field(name="👍 Плюсы", value=plus_text, inline=True)
+        
+        # Добавляем скриншот если есть
+        if capt.screenshot_url:
+            embed.set_image(url=capt.screenshot_url)
         
         # Информация о времени
         time_left = timedelta(hours=1) - (datetime.now() - capt.created_at)
@@ -170,9 +175,6 @@ async def update_capt_embed(message_id):
         view.add_item(plus_button)
         view.add_item(remove_plus_button)
         
-        # Если у пользователя есть роль регистратора, добавляем кнопку регистрации
-        # Она будет отображаться, но проверка прав будет при нажатии
-        
         await message.edit(embed=embed, view=view)
         
         return True
@@ -181,35 +183,140 @@ async def update_capt_embed(message_id):
         print(f"Ошибка при обновлении капта {message_id}: {e}")
         return False
 
-async def start_screenshot_wait(message_id):
+async def send_capt_message(channel, capt):
+    """Отправляет финальное сообщение с @everyone и embed"""
+    # Отправляем @everyone
+    await channel.send("@everyone")
+    
+    # Формируем embed
+    registered_text = ""
+    if capt.registered_users:
+        for i, user in enumerate(capt.registered_users, 1):
+            registered_text += f"{i}. {user.mention}\n"
+    else:
+        registered_text = "Нет зарегистрированных"
+    
+    plus_text = ""
+    if capt.plus_users:
+        for i, user in enumerate(capt.plus_users, 1):
+            plus_text += f"{i}. {user.mention}\n"
+    else:
+        plus_text = "Нет плюсов"
+    
+    embed = discord.Embed(
+        color=0x0099ff,
+        title=f"📋 {capt.title_text}",
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="📝 Регнутые игроки", value=registered_text, inline=True)
+    embed.add_field(name="👍 Плюсы", value=plus_text, inline=True)
+    
+    # Добавляем скриншот если есть
+    if capt.screenshot_url:
+        embed.set_image(url=capt.screenshot_url)
+    
+    # Информация о времени
+    embed.set_footer(text=f"🔄 Обновляется по кнопкам • Активен 1 час")
+    
+    # Создаем кнопки
+    view = discord.ui.View(timeout=None)
+    
+    plus_button = discord.ui.Button(
+        label="➕ Кинуть плюс",
+        style=discord.ButtonStyle.success,
+        custom_id=f"plus_{capt.message_id}"
+    )
+    remove_plus_button = discord.ui.Button(
+        label="➖ Убрать плюс",
+        style=discord.ButtonStyle.danger,
+        custom_id=f"remove_plus_{capt.message_id}"
+    )
+    
+    view.add_item(plus_button)
+    view.add_item(remove_plus_button)
+    
+    message = await channel.send(embed=embed, view=view)
+    capt.message_id = message.id
+    capt.message_sent = True
+    
+    return message
+
+async def start_screenshot_wait(message_id, interaction):
     """Запускает ожидание скриншота"""
     if message_id not in active_capts:
         return
     
     capt = active_capts[message_id]
     
-    async def wait_for_screenshot():
-        await asyncio.sleep(SCREENSHOT_WAIT_TIME)
-        if capt.is_active and not capt.screenshot_provided:
-            # Время вышло, отправляем без скриншота
-            capt.screenshot_provided = True  # Помечаем как обработанное
-            
-            # Отправляем сообщение с текстом
-            channel = bot.get_channel(capt.channel_id)
-            if channel:
-                await channel.send(f"{capt.text}")
-                await update_capt_embed(message_id)
-                
-                await send_log(
-                    f"⏰ **Скриншот не получен**\n"
-                    f"• Капт ID: {message_id}\n"
-                    f"• Создатель: <@{capt.creator_id}>\n"
-                    f"• Текст: {capt.text[:100]}",
-                    color=0xffaa00,
-                    title="⏰ Таймаут скриншота"
-                )
+    # Отправляем сообщение с просьбой прислать скриншот
+    embed = discord.Embed(
+        color=0xffaa00,
+        title="📸 Ожидание скриншота",
+        description=f"<@&{ALLOWED_CREATOR_ROLE}>, пожалуйста, отправьте скриншот в этот канал.\n\n"
+                    f"**Текст капта:** {capt.title_text}\n"
+                    f"⏰ Время ожидания: 5 минут",
+        timestamp=datetime.now()
+    )
     
-    capt.screenshot_wait_task = asyncio.create_task(wait_for_screenshot())
+    wait_message = await interaction.channel.send(embed=embed)
+    
+    # Функция для проверки сообщений
+    def check(msg):
+        return (msg.author.id == interaction.user.id and 
+                msg.channel.id == interaction.channel.id and
+                msg.attachments and 
+                any(att.content_type and att.content_type.startswith('image/') for att in msg.attachments))
+    
+    try:
+        # Ждем сообщение со скриншотом
+        screenshot_msg = await bot.wait_for('message', timeout=SCREENSHOT_WAIT_TIME, check=check)
+        
+        # Получаем URL скриншота
+        capt.screenshot_url = screenshot_msg.attachments[0].url
+        capt.screenshot_user = screenshot_msg.author
+        
+        # Удаляем сообщение с ожиданием
+        await wait_message.delete()
+        
+        # Отправляем финальное сообщение
+        await send_capt_message(interaction.channel, capt)
+        
+        await send_log(
+            f"📸 **Скриншот получен**\n"
+            f"• Капт: {capt.title_text}\n"
+            f"• Отправил: {screenshot_msg.author.mention}\n"
+            f"• Скриншот: [ссылка]({capt.screenshot_url})",
+            color=0x00ff00,
+            title="📸 Скриншот получен"
+        )
+        
+        # Запускаем задачу истечения через час
+        async def expire_loop():
+            await asyncio.sleep(3600)
+            await disable_capt(capt.message_id)
+        
+        capt.expire_task = asyncio.create_task(expire_loop())
+        
+    except asyncio.TimeoutError:
+        # Время вышло, отправляем без скриншота
+        await wait_message.delete()
+        await send_capt_message(interaction.channel, capt)
+        
+        await send_log(
+            f"⏰ **Время ожидания скриншота истекло**\n"
+            f"• Капт: {capt.title_text}\n"
+            f"• Создатель: <@{capt.creator_id}>",
+            color=0xffaa00,
+            title="⏰ Таймаут скриншота"
+        )
+        
+        # Запускаем задачу истечения через час
+        async def expire_loop():
+            await asyncio.sleep(3600)
+            await disable_capt(capt.message_id)
+        
+        capt.expire_task = asyncio.create_task(expire_loop())
 
 async def disable_capt(message_id):
     """Деактивирует капт через час"""
@@ -255,6 +362,7 @@ async def disable_capt(message_id):
             await send_log(
                 f"⏰ **Капт завершен**\n"
                 f"• Канал: {channel.mention}\n"
+                f"• Название: {capt.title_text}\n"
                 f"• Создатель: <@{capt.creator_id}>\n"
                 f"• Зарегистрировано: {len(capt.registered_users)}\n"
                 f"• Плюсов: {len(capt.plus_users)}",
@@ -268,8 +376,8 @@ async def disable_capt(message_id):
     if message_id in active_capts:
         del active_capts[message_id]
 
-@bot.tree.command(name="capt", description="Создать капт с текстом")
-@app_commands.describe(text="Текст для отправки (например: @everyone ПРАК, ВСЕ В РЕГУ // КОД ГРУППЫ - D2YXN)")
+@bot.tree.command(name="capt", description="Создать капт")
+@app_commands.describe(text="Текст для заголовка капта (например: ПРАК, ВСЕ В РЕГУ // КОД ГРУППЫ - D2YXN)")
 async def capt_command(interaction: discord.Interaction, text: str):
     # Проверка прав
     if not check_creator_role(interaction):
@@ -284,26 +392,69 @@ async def capt_command(interaction: discord.Interaction, text: str):
     embed = discord.Embed(
         color=0x0099ff,
         title="📸 Нужен скриншот?",
-        description="Требуется ли скриншот для этого капта?\n\n"
-                    f"**Текст:** {text}",
+        description=f"**Текст капта:** {text}\n\nТребуется ли скриншот для этого капта?",
         timestamp=datetime.now()
     )
     
     view = discord.ui.View(timeout=60)
     
     async def yes_callback(interaction_btn: discord.Interaction):
-        await interaction_btn.response.defer()
-        await interaction_btn.followup.send("✅ Скриншот будет ожидаться 5 минут", ephemeral=True)
+        await interaction_btn.response.defer(ephemeral=True)
         
         # Создаем капт с ожиданием скриншота
-        await create_capt(interaction_btn, text, need_screenshot=True)
+        capt = CaptManager(
+            message_id=0,  # Временный ID, будет обновлен позже
+            channel_id=interaction_btn.channel_id,
+            creator_id=interaction_btn.user.id,
+            title_text=text,
+            need_screenshot=True
+        )
+        
+        # Сохраняем временно
+        temp_id = id(capt)
+        active_capts[temp_id] = capt
+        
+        await interaction_btn.followup.send("✅ Скриншот будет ожидаться 5 минут. Пожалуйста, отправьте скриншот в этот канал.", ephemeral=True)
+        
+        # Запускаем ожидание скриншота
+        await start_screenshot_wait(temp_id, interaction_btn)
     
     async def no_callback(interaction_btn: discord.Interaction):
-        await interaction_btn.response.defer()
-        await interaction_btn.followup.send("✅ Капт создан без скриншота", ephemeral=True)
+        await interaction_btn.response.defer(ephemeral=True)
         
         # Создаем капт без скриншота
-        await create_capt(interaction_btn, text, need_screenshot=False)
+        capt = CaptManager(
+            message_id=0,
+            channel_id=interaction_btn.channel_id,
+            creator_id=interaction_btn.user.id,
+            title_text=text,
+            need_screenshot=False
+        )
+        
+        # Отправляем сообщение с @everyone и embed
+        await send_capt_message(interaction_btn.channel, capt)
+        
+        # Сохраняем в активные
+        active_capts[capt.message_id] = capt
+        
+        # Запускаем задачу истечения через час
+        async def expire_loop():
+            await asyncio.sleep(3600)
+            await disable_capt(capt.message_id)
+        
+        capt.expire_task = asyncio.create_task(expire_loop())
+        
+        await interaction_btn.followup.send("✅ Капт создан без скриншота!", ephemeral=True)
+        
+        await send_log(
+            f"✅ **Новый капт создан (без скриншота)**\n"
+            f"• Канал: {interaction_btn.channel.mention}\n"
+            f"• Сообщение: [ссылка](https://discord.com/channels/{interaction_btn.guild.id}/{interaction_btn.channel.id}/{capt.message_id})\n"
+            f"• Создатель: {interaction_btn.user.mention}\n"
+            f"• Текст: {text}",
+            color=0x00ff00,
+            title="📋 Новый капт"
+        )
     
     yes_button = discord.ui.Button(label="✅ Да", style=discord.ButtonStyle.success)
     yes_button.callback = yes_callback
@@ -315,127 +466,6 @@ async def capt_command(interaction: discord.Interaction, text: str):
     view.add_item(no_button)
     
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-async def create_capt(interaction: discord.Interaction, text: str, need_screenshot: bool):
-    """Создает капт после ответа о скриншоте"""
-    channel = interaction.channel
-    
-    # Создаем embed
-    embed = discord.Embed(
-        color=0x0099ff,
-        title=f"📋 Капт",
-        description="Загрузка...",
-        timestamp=datetime.now()
-    )
-    
-    embed.add_field(name="📝 Регнутые игроки", value="Загрузка...", inline=True)
-    embed.add_field(name="👍 Плюсы", value="Загрузка...", inline=True)
-    embed.set_footer(text="Создание капта...")
-    
-    # Создаем временные кнопки
-    view = discord.ui.View(timeout=None)
-    plus_button = discord.ui.Button(
-        label="➕ Кинуть плюс",
-        style=discord.ButtonStyle.secondary,
-        disabled=True,
-        custom_id="plus_temp"
-    )
-    remove_plus_button = discord.ui.Button(
-        label="➖ Убрать плюс",
-        style=discord.ButtonStyle.secondary,
-        disabled=True,
-        custom_id="remove_plus_temp"
-    )
-    view.add_item(plus_button)
-    view.add_item(remove_plus_button)
-    
-    message = await channel.send(embed=embed, view=view)
-    
-    # Создаем менеджер капта
-    capt = CaptManager(
-        message.id, 
-        channel.id, 
-        interaction.user.id, 
-        text, 
-        need_screenshot
-    )
-    active_capts[message.id] = capt
-    
-    # Если нужен скриншот, запускаем ожидание
-    if need_screenshot:
-        await start_screenshot_wait(message.id)
-        
-        # Отправляем сообщение о необходимости скриншота
-        await channel.send(
-            f"<@&{ALLOWED_CREATOR_ROLE}> Ожидается скриншот в течение 5 минут!\n"
-            f"Отправьте скриншот в этот канал или используйте кнопку ниже.",
-            view=ScreenshotWaitView(message.id)
-        )
-    else:
-        # Сразу отправляем текст
-        await channel.send(f"{text}")
-        await update_capt_embed(message.id)
-    
-    # Запускаем задачу истечения через час
-    async def expire_loop():
-        await asyncio.sleep(3600)
-        await disable_capt(message.id)
-    
-    capt.expire_task = asyncio.create_task(expire_loop())
-    
-    # Логируем создание
-    await send_log(
-        f"✅ **Новый капт создан**\n"
-        f"• Канал: {channel.mention}\n"
-        f"• Сообщение: [ссылка]({message.jump_url})\n"
-        f"• Создатель: {interaction.user.mention}\n"
-        f"• Текст: {text}\n"
-        f"• Скриншот: {'Да' if need_screenshot else 'Нет'}",
-        color=0x00ff00,
-        title="📋 Новый капт"
-    )
-
-class ScreenshotWaitView(discord.ui.View):
-    def __init__(self, capt_id):
-        super().__init__(timeout=300)  # 5 минут таймаут
-        self.capt_id = capt_id
-    
-    @discord.ui.button(label="📸 Скриншот отправлен", style=discord.ButtonStyle.success, custom_id="screenshot_done")
-    async def screenshot_done(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not check_creator_role(interaction):
-            await interaction.response.send_message("❌ У вас нет прав для подтверждения скриншота", ephemeral=True)
-            return
-        
-        if self.capt_id not in active_capts:
-            await interaction.response.send_message("❌ Капт не найден", ephemeral=True)
-            return
-        
-        capt = active_capts[self.capt_id]
-        if capt.screenshot_provided:
-            await interaction.response.send_message("❌ Скриншот уже был подтвержден", ephemeral=True)
-            return
-        
-        capt.screenshot_provided = True
-        if capt.screenshot_wait_task:
-            capt.screenshot_wait_task.cancel()
-        
-        # Отправляем текст
-        channel = interaction.channel
-        await channel.send(f"{capt.text}")
-        await update_capt_embed(self.capt_id)
-        
-        # Удаляем это сообщение с кнопкой
-        await interaction.message.delete()
-        
-        await interaction.response.send_message("✅ Скриншот подтвержден! Капт активирован.", ephemeral=True)
-        
-        await send_log(
-            f"📸 **Скриншот получен**\n"
-            f"• Капт ID: {self.capt_id}\n"
-            f"• Подтвердил: {interaction.user.mention}",
-            color=0x00ff00,
-            title="📸 Скриншот"
-        )
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
@@ -458,6 +488,11 @@ async def on_interaction(interaction: discord.Interaction):
             
             user = interaction.user
             
+            # Проверяем, есть ли пользователь в зарегистрированных
+            if user.id in [u.id for u in capt.registered_users]:
+                await interaction.response.send_message("❌ Зарегистрированные игроки не могут ставить плюсы!", ephemeral=True)
+                return
+            
             if user.id in [u.id for u in capt.plus_users]:
                 await interaction.response.send_message("❌ Вы уже поставили плюс!", ephemeral=True)
                 return
@@ -468,7 +503,7 @@ async def on_interaction(interaction: discord.Interaction):
             
             await send_log(
                 f"➕ **Плюс поставлен**\n"
-                f"• Капт ID: {message_id}\n"
+                f"• Капт: {capt.title_text}\n"
                 f"• Пользователь: {user.mention}",
                 color=0x00ff00,
                 title="➕ Плюс"
@@ -499,58 +534,18 @@ async def on_interaction(interaction: discord.Interaction):
             
             await send_log(
                 f"➖ **Плюс убран**\n"
-                f"• Капт ID: {message_id}\n"
+                f"• Капт: {capt.title_text}\n"
                 f"• Пользователь: {user.mention}",
                 color=0xffaa00,
                 title="➖ Плюс убран"
             )
-        
-        # Обработка регистрации пользователей (только для роли 1478205318591938671)
-        elif custom_id.startswith("register_"):
-            message_id = int(custom_id.split("_")[1])
-            target_user_id = int(custom_id.split("_")[2])
-            
-            if not check_register_role(interaction):
-                await interaction.response.send_message("❌ У вас нет прав для регистрации пользователей", ephemeral=True)
-                return
-            
-            if message_id not in active_capts:
-                await interaction.response.send_message("❌ Капт не найден", ephemeral=True)
-                return
-            
-            capt = active_capts[message_id]
-            if not capt.is_active:
-                await interaction.response.send_message("❌ Срок действия капта истек", ephemeral=True)
-                return
-            
-            target_user = interaction.guild.get_member(target_user_id)
-            if not target_user:
-                await interaction.response.send_message("❌ Пользователь не найден", ephemeral=True)
-                return
-            
-            if target_user.id in [u.id for u in capt.registered_users]:
-                await interaction.response.send_message("❌ Пользователь уже зарегистрирован!", ephemeral=True)
-                return
-            
-            capt.registered_users.append(target_user)
-            await update_capt_embed(message_id)
-            await interaction.response.send_message(f"✅ Пользователь {target_user.mention} зарегистрирован!", ephemeral=True)
-            
-            await send_log(
-                f"📝 **Пользователь зарегистрирован**\n"
-                f"• Капт ID: {message_id}\n"
-                f"• Зарегистрировал: {interaction.user.mention}\n"
-                f"• Пользователь: {target_user.mention}",
-                color=0x00ff00,
-                title="📝 Регистрация"
-            )
 
 @bot.tree.command(name="регистрация", description="Зарегистрировать пользователя в капте")
 @app_commands.describe(
-    сообщение="ID сообщения с каптом",
+    сообщение_id="ID сообщения с каптом",
     пользователь="Пользователь для регистрации"
 )
-async def register_user_command(interaction: discord.Interaction, сообщение: str, пользователь: discord.User):
+async def register_user_command(interaction: discord.Interaction, сообщение_id: str, пользователь: discord.User):
     """Команда для регистрации пользователя (только для роли 1478205318591938671)"""
     if not check_register_role(interaction):
         await interaction.response.send_message(
@@ -561,7 +556,7 @@ async def register_user_command(interaction: discord.Interaction, сообщен
         return
     
     try:
-        message_id = int(сообщение)
+        message_id = int(сообщение_id)
         
         if message_id not in active_capts:
             await interaction.response.send_message("❌ Капт не найден или уже неактивен", ephemeral=True)
@@ -572,18 +567,25 @@ async def register_user_command(interaction: discord.Interaction, сообщен
             await interaction.response.send_message("❌ Срок действия капта истек", ephemeral=True)
             return
         
+        # Проверяем, не зарегистрирован ли уже
         if пользователь.id in [u.id for u in capt.registered_users]:
             await interaction.response.send_message("❌ Пользователь уже зарегистрирован!", ephemeral=True)
             return
         
+        # Добавляем в зарегистрированные
         capt.registered_users.append(пользователь)
+        
+        # Удаляем из плюсов если был
+        if пользователь.id in [u.id for u in capt.plus_users]:
+            capt.plus_users = [u for u in capt.plus_users if u.id != пользователь.id]
+        
         await update_capt_embed(message_id)
         
         await interaction.response.send_message(f"✅ Пользователь {пользователь.mention} зарегистрирован в капте!", ephemeral=True)
         
         await send_log(
             f"📝 **Пользователь зарегистрирован**\n"
-            f"• Капт ID: {message_id}\n"
+            f"• Капт: {capt.title_text}\n"
             f"• Зарегистрировал: {interaction.user.mention}\n"
             f"• Пользователь: {пользователь.mention}",
             color=0x00ff00,
@@ -613,8 +615,9 @@ async def list_capts(interaction: discord.Interaction):
         minutes_left = int(time_left.total_seconds() / 60)
         
         embed.add_field(
-            name=f"Капт #{message_id}",
-            value=f"• Канал: <#{capt.channel_id}>\n"
+            name=f"Капт: {capt.title_text[:50]}",
+            value=f"• ID: {message_id}\n"
+                  f"• Канал: <#{capt.channel_id}>\n"
                   f"• Создатель: <@{capt.creator_id}>\n"
                   f"• Зарегистрировано: {len(capt.registered_users)}\n"
                   f"• Плюсов: {len(capt.plus_users)}\n"
