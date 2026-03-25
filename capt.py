@@ -17,7 +17,7 @@ ALLOWED_ROLES = [
     1478205318591938671
 ]
 LOG_CHANNEL_ID = 1448991378750046209  # Канал для логов
-AUTO_UPDATE_INTERVAL = 5  # секунд
+AUTO_UPDATE_INTERVAL = 5  # секунд - теперь реально будет обновляться каждые 5 секунд
 
 # Хранилище активных каптов
 active_capts = {}
@@ -31,7 +31,8 @@ class CaptManager:
         self.is_active = True
         self.expire_task = None
         self.auto_update_task = None
-        self.update_count = 0  # Счетчик обновлений
+        self.update_count = 0
+        self.last_users = []  # Кэш последних пользователей
 
 # Правильная настройка интентов
 intents = discord.Intents.default()
@@ -84,7 +85,6 @@ async def on_ready():
     print(f'✅ Бот {bot.user} запущен!')
     print(f'Подключен к серверам: {len(bot.guilds)}')
     
-    # Отправляем лог о запуске
     await send_log(
         f"✅ **Бот запущен**\n"
         f"• Пользователь: {bot.user} (ID: {bot.user.id})\n"
@@ -100,23 +100,20 @@ async def on_ready():
 async def get_users_with_checkmark_from_target_role(channel):
     """
     Получает ВСЕХ пользователей, на чьих сообщениях есть реакция ✅,
-    которую поставил пользователь с ролью TARGET_ROLE_ID
+    которую поставил пользователь с ролью TARGET_ROLE_ID.
+    Возвращает список кортежей (пользователь, время_первой_реакции)
     """
     target_role = channel.guild.get_role(TARGET_ROLE_ID)
     if not target_role:
         print(f"⚠️ Роль {TARGET_ROLE_ID} не найдена на сервере {channel.guild.name}")
         return []
     
-    # Множество для хранения уникальных пользователей (авторов сообщений)
-    message_authors = set()
-    messages_checked = 0
-    reactions_checked = 0
+    # Словарь для хранения {user_id: (user, first_reaction_time)}
+    user_data = {}
     
     try:
-        # Перебираем все сообщения в канале (до 1000 сообщений)
-        async for message in channel.history(limit=1000):
-            messages_checked += 1
-            
+        # Перебираем все сообщения в канале (увеличил лимит для точности)
+        async for message in channel.history(limit=2000):
             # Проверяем все реакции на сообщении
             for reaction in message.reactions:
                 # Проверяем, что это нужная реакция ✅
@@ -127,25 +124,37 @@ async def get_users_with_checkmark_from_target_role(channel):
                         if isinstance(user, discord.Member):
                             # Если пользователь, поставивший реакцию, имеет целевую роль
                             if target_role in user.roles:
-                                reactions_checked += 1
-                                # Добавляем АВТОРА сообщения в список
+                                # Добавляем АВТОРА сообщения в словарь с временем сообщения
                                 if message.author and not message.author.bot:
-                                    message_authors.add(message.author)
-                                break  # Достаточно одной такой реакции на сообщении
+                                    user_id = message.author.id
+                                    reaction_time = message.created_at
+                                    
+                                    # Сохраняем самое раннее время реакции для каждого пользователя
+                                    if user_id not in user_data:
+                                        user_data[user_id] = (message.author, reaction_time)
+                                    else:
+                                        # Если нашли более раннюю реакцию, обновляем время
+                                        if reaction_time < user_data[user_id][1]:
+                                            user_data[user_id] = (message.author, reaction_time)
         
-        print(f"📊 Проверено сообщений: {messages_checked}")
-        print(f"✅ Найдено реакций от целевой роли: {reactions_checked}")
-        print(f"👥 Уникальных авторов сообщений: {len(message_authors)}")
+        # Преобразуем в список и сортируем по времени (от самого раннего к позднему)
+        users_list = [(user, reaction_time) for user, reaction_time in user_data.values()]
+        users_list.sort(key=lambda x: x[1])  # Сортировка по времени реакции
+        
+        print(f"📊 Найдено {len(users_list)} пользователей, отсортировано по времени")
+        
+        # Возвращаем только список пользователей (без времени)
+        return [user for user, _ in users_list]
         
     except discord.Forbidden:
         print(f"❌ Нет доступа к каналу {channel.name}")
+        return []
     except Exception as e:
         print(f"❌ Ошибка при обработке канала {channel.name}: {e}")
-    
-    return list(message_authors)
+        return []
 
 async def update_capt_list(message_id, auto_update=False):
-    """Обновляет список пользователей в embed"""
+    """Обновляет список пользователей в embed с оптимизацией"""
     if message_id not in active_capts:
         return False
     
@@ -158,27 +167,31 @@ async def update_capt_list(message_id, auto_update=False):
         return False
     
     try:
+        start_time = datetime.now()
         message = await channel.fetch_message(message_id)
         
-        # Получаем ВСЕХ пользователей, на чьи сообщения поставили ✅ с целевой ролью
+        # Получаем отсортированных пользователей
         users = await get_users_with_checkmark_from_target_role(channel)
         
+        # Проверяем, изменился ли список
+        current_user_ids = [user.id for user in users]
+        old_user_ids = [user.id for user in capt.last_users] if capt.last_users else []
+        
+        has_changed = current_user_ids != old_user_ids
+        
         if users:
-            # Сортируем пользователей по имени
-            users.sort(key=lambda x: x.display_name.lower())
-            
             # Создаем описание со списком пользователей
             description_parts = [f"**Найдено пользователей: {len(users)}**\n"]
             
-            # Добавляем пользователей с отступами
+            # Добавляем пользователей с нумерацией по порядку (кто раньше поставил реакцию - тот выше в списке)
             for i, user in enumerate(users, 1):
                 description_parts.append(f"{i}. {user.mention}")
             
             description = '\n'.join(description_parts)
-            color = 0x00ff00  # Зеленый
+            color = 0x00ff00
         else:
             description = '❌ Пользователи с реакцией ✅ от целевой роли не найдены'
-            color = 0xff0000  # Красный
+            color = 0xff0000
         
         embed = discord.Embed(
             color=color,
@@ -187,21 +200,19 @@ async def update_capt_list(message_id, auto_update=False):
             timestamp=datetime.now()
         )
         
-        # Добавляем информацию о канале
         embed.add_field(
             name="📌 Канал",
             value=f"{channel.mention}",
             inline=True
         )
         
-        # Добавляем информацию о реакции и роли
         embed.add_field(
             name="✅ Условие",
             value=f"Реакция `{CHECKMARK_EMOJI}` от <@&{TARGET_ROLE_ID}>",
             inline=False
         )
         
-        # Добавляем информацию о времени и автообновлении
+        # Информация о времени
         time_left = timedelta(hours=1) - (datetime.now() - capt.created_at)
         minutes_left = int(time_left.total_seconds() / 60)
         seconds_left = int(time_left.total_seconds() % 60)
@@ -211,15 +222,21 @@ async def update_capt_list(message_id, auto_update=False):
         else:
             time_str = f"Осталось {seconds_left} сек"
         
-        # Добавляем информацию об автообновлении
-        auto_update_status = f"🔄 Автообновление ({capt.update_count})" if capt.auto_update_task else "⏸️ Автообновление остановлено"
+        # Время последнего обновления
+        update_time_str = datetime.now().strftime("%H:%M:%S")
+        auto_update_status = f"🔄 Автообновление ({capt.update_count}) • Последнее: {update_time_str}"
             
         embed.set_footer(text=f"{auto_update_status} • {time_str}")
         
         await message.edit(embed=embed)
         
-        # Увеличиваем счетчик обновлений
+        # Сохраняем текущий список для сравнения
+        capt.last_users = users.copy()
         capt.update_count += 1
+        
+        elapsed = (datetime.now() - start_time).total_seconds()
+        if auto_update:
+            print(f"🤖 Автообновление #{capt.update_count} выполнено за {elapsed:.2f} сек, пользователей: {len(users)}")
         
         return True
         
@@ -231,9 +248,9 @@ async def update_capt_list(message_id, auto_update=False):
             del active_capts[message_id]
         return False
     except Exception as e:
-        error_msg = f"❌ Ошибка при обновлении капта {message_id}: {e}\n```{traceback.format_exc()}```"
+        error_msg = f"❌ Ошибка при обновлении капта {message_id}: {e}"
         print(error_msg)
-        await send_log(error_msg[:1000], color=0xff0000, title="❌ Ошибка обновления")
+        traceback.print_exc()
         return False
 
 async def start_auto_update(message_id):
@@ -246,9 +263,12 @@ async def start_auto_update(message_id):
     async def auto_update_loop():
         try:
             while capt.is_active:
+                # Используем asyncio.sleep, который не блокирует
                 await asyncio.sleep(AUTO_UPDATE_INTERVAL)
                 if capt.is_active:
-                    await update_capt_list(message_id, auto_update=True)
+                    # Запускаем обновление, но не ждем его завершения, если оно долгое
+                    # Это предотвращает накопление задержек
+                    asyncio.create_task(update_capt_list(message_id, auto_update=True))
         except asyncio.CancelledError:
             print(f"🛑 Автообновление капта {message_id} остановлено")
     
@@ -263,7 +283,6 @@ async def disable_capt(message_id):
     capt = active_capts[message_id]
     capt.is_active = False
     
-    # Останавливаем автообновление
     if capt.auto_update_task:
         capt.auto_update_task.cancel()
     
@@ -272,12 +291,10 @@ async def disable_capt(message_id):
         try:
             message = await channel.fetch_message(message_id)
             
-            # Обновляем embed с пометкой об истечении
             embed = message.embeds[0]
             embed.color = 0x808080
             embed.set_footer(text="⏰ Срок действия истек")
             
-            # Деактивируем кнопку
             view = discord.ui.View(timeout=None)
             button = discord.ui.Button(
                 label="🔄 Обновить",
@@ -290,7 +307,6 @@ async def disable_capt(message_id):
             await message.edit(embed=embed, view=view)
             print(f"✅ Капт {message_id} деактивирован")
             
-            # Логируем деактивацию
             await send_log(
                 f"⏰ **Капт завершен**\n"
                 f"• Канал: {channel.mention}\n"
@@ -314,7 +330,6 @@ def check_allowed_roles(interaction: discord.Interaction) -> bool:
 
 @bot.tree.command(name="capt", description="Создать список пользователей с реакцией ✅ от целевой роли")
 async def capt_command(interaction: discord.Interaction):
-    # Проверка прав
     if not check_allowed_roles(interaction):
         await interaction.response.send_message(
             "❌ У вас нет прав на использование этой команды.\n"
@@ -323,7 +338,6 @@ async def capt_command(interaction: discord.Interaction):
         )
         return
     
-    # Создаем embed
     embed = discord.Embed(
         color=0x0099ff,
         title='📋 Список на капт',
@@ -331,7 +345,6 @@ async def capt_command(interaction: discord.Interaction):
         timestamp=datetime.now()
     )
     
-    # Добавляем информацию о канале и условиях
     embed.add_field(
         name="📌 Канал",
         value=f"{interaction.channel.mention}",
@@ -344,13 +357,12 @@ async def capt_command(interaction: discord.Interaction):
     )
     embed.add_field(
         name="📋 Результат",
-        value="Все пользователи, на чьи сообщения поставили ✅",
+        value="Все пользователи, на чьи сообщения поставили ✅\n**Сортировка:** по времени первой реакции",
         inline=False
     )
     
     embed.set_footer(text=f"🔄 Автообновление каждые {AUTO_UPDATE_INTERVAL} сек • Активен 1 час")
     
-    # Создаем кнопку
     view = discord.ui.View(timeout=None)
     button = discord.ui.Button(
         label="🔄 Обновить",
@@ -362,28 +374,25 @@ async def capt_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view)
     message = await interaction.original_response()
     
-    # Создаем менеджер капта
     capt = CaptManager(message.id, interaction.channel_id, interaction.user.id)
     active_capts[message.id] = capt
     
-    # Запускаем автообновление
     await start_auto_update(message.id)
     
-    # Запускаем задачу истечения
     async def expire_loop():
-        await asyncio.sleep(3600)  # 1 час
+        await asyncio.sleep(3600)
         await disable_capt(message.id)
     
     capt.expire_task = asyncio.create_task(expire_loop())
     
-    # Логируем создание капта
     await send_log(
         f"✅ **Новый капт создан**\n"
         f"• Канал: {interaction.channel.mention}\n"
         f"• Сообщение: [ссылка]({message.jump_url})\n"
         f"• Создатель: {interaction.user.mention}\n"
         f"• Условие: реакция {CHECKMARK_EMOJI} от <@&{TARGET_ROLE_ID}>\n"
-        f"• Автообновление: каждые {AUTO_UPDATE_INTERVAL} сек",
+        f"• Автообновление: каждые {AUTO_UPDATE_INTERVAL} сек\n"
+        f"• Сортировка: по времени реакции",
         color=0x00ff00,
         title="📋 Новый капт"
     )
@@ -397,7 +406,6 @@ class CaptButton(discord.ui.Button):
         )
     
     async def callback(self, interaction: discord.Interaction):
-        # Проверка прав
         if not check_allowed_roles(interaction):
             await interaction.response.send_message(
                 "❌ У вас нет прав на использование этой кнопки.", 
@@ -405,18 +413,18 @@ class CaptButton(discord.ui.Button):
             )
             return
         
+        await interaction.response.defer(ephemeral=True)
+        
         message_id = interaction.message.id
         
         if message_id in active_capts:
             capt = active_capts[message_id]
             if capt.is_active:
-                # Отправляем начальное сообщение
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"🔍 Поиск пользователей с реакцией {CHECKMARK_EMOJI} от <@&{TARGET_ROLE_ID}>...", 
                     ephemeral=True
                 )
                 
-                # Обновляем список (ручное обновление)
                 success = await update_capt_list(message_id)
                 
                 if success:
@@ -424,43 +432,15 @@ class CaptButton(discord.ui.Button):
                 else:
                     await interaction.followup.send("❌ Ошибка при обновлении списка.", ephemeral=True)
             else:
-                await interaction.response.send_message(
-                    "❌ Срок действия этого капта истек.", 
-                    ephemeral=True
-                )
+                await interaction.followup.send("❌ Срок действия этого капта истек.", ephemeral=True)
         else:
-            # Проверяем, может быть капт уже истек, но сообщение осталось
-            try:
-                message = await interaction.message.fetch()
-                if message.embeds:
-                    embed = message.embeds[0]
-                    if embed.footer and "Срок действия истек" in embed.footer.text:
-                        await interaction.response.send_message(
-                            "❌ Срок действия этого капта истек.", 
-                            ephemeral=True
-                        )
-                    else:
-                        await interaction.response.send_message(
-                            "❌ Капт не найден в активных. Возможно, бот был перезапущен.", 
-                            ephemeral=True
-                        )
-                else:
-                    await interaction.response.send_message(
-                        "❌ Капт не найден.", 
-                        ephemeral=True
-                    )
-            except:
-                await interaction.response.send_message(
-                    "❌ Капт не найден.", 
-                    ephemeral=True
-                )
+            await interaction.followup.send("❌ Капт не найден.", ephemeral=True)
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     """Обработка нажатий на кнопки"""
     if interaction.type == discord.InteractionType.component:
         if interaction.data["custom_id"] == "refresh_capt":
-            # Создаем и вызываем кнопку
             button = CaptButton()
             await button.callback(interaction)
 
@@ -476,7 +456,6 @@ async def cleanup_expired_capts():
     
     for message_id in expired:
         if message_id in active_capts:
-            # Останавливаем автообновление
             if active_capts[message_id].auto_update_task:
                 active_capts[message_id].auto_update_task.cancel()
             del active_capts[message_id]
