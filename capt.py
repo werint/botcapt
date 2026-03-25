@@ -17,7 +17,7 @@ ALLOWED_ROLES = [
     1478205318591938671
 ]
 LOG_CHANNEL_ID = 1448991378750046209  # Канал для логов
-AUTO_UPDATE_INTERVAL = 20  # секунд
+AUTO_UPDATE_INTERVAL = 5  # секунд
 
 # Хранилище активных каптов
 active_capts = {}
