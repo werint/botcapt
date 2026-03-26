@@ -11,7 +11,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 ALLOWED_CREATOR_ROLE = 1478205318591938671
 LOG_CHANNEL_ID = 1448991378750046209
 SCREENSHOT_WAIT_TIME = 300
-SCREENSHOT_DELETE_DELAY = 6  # Задержка перед удалением скриншота
+SCREENSHOT_DELETE_DELAY = 6
 
 # ID ролей для отображения
 ROLE_IDS = {
@@ -285,10 +285,8 @@ async def start_screenshot_wait(capt, interaction):
         capt.screenshot_url = screenshot_msg.attachments[0].url
         capt.screenshot_user = screenshot_msg.author
         
-        # Сначала отправляем финальное сообщение
         await send_capt_message(interaction.channel, capt)
         
-        # Затем удаляем сообщение со скриншотом с задержкой
         await asyncio.sleep(SCREENSHOT_DELETE_DELAY)
         await screenshot_msg.delete()
         
@@ -439,7 +437,6 @@ class RegisterSelect(discord.ui.Select):
         
         await update_capt_embed(self.capt.message_id)
         
-        # Формируем сообщение о зарегистрированных
         users_list = "\n".join([f"• {u.mention}" for u in selected_users])
         await interaction.response.send_message(
             f"✅ Зарегистрированы:\n{users_list}",
@@ -455,8 +452,77 @@ class RegisterSelect(discord.ui.Select):
             title="📝 Массовая регистрация"
         )
 
-# Класс для пагинации
-class PaginationView(discord.ui.View):
+# Класс для выбора пользователей на снятие регистрации (только те, кто в регнутых)
+class UnregisterSelect(discord.ui.Select):
+    def __init__(self, capt, registered_users_page, page_num, total_pages):
+        self.capt = capt
+        self.page_num = page_num
+        self.total_pages = total_pages
+        options = []
+        
+        for member in registered_users_page:
+            # Получаем роли пользователя
+            primary_role, secondary_role = get_user_roles_info(member)
+            
+            # Формируем описание с ролями
+            role_text = f"{primary_role if primary_role else 'Нет роли'}"
+            if secondary_role:
+                role_text += f" | {secondary_role}"
+            
+            options.append(
+                discord.SelectOption(
+                    label=f"{member.display_name}",
+                    description=role_text[:100],
+                    value=str(member.id)
+                )
+            )
+        
+        super().__init__(
+            placeholder=f"Страница {page_num}/{total_pages} - Выберите пользователей для снятия регистрации",
+            min_values=1,
+            max_values=min(25, len(options)),
+            options=options
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        if not check_creator_role(interaction):
+            await interaction.response.send_message("❌ У вас нет прав", ephemeral=True)
+            return
+        
+        selected_users = []
+        for user_id_str in self.values:
+            user_id = int(user_id_str)
+            member = interaction.guild.get_member(user_id)
+            if member:
+                selected_users.append(member)
+        
+        # Снимаем регистрацию с выбранных пользователей
+        for user in selected_users:
+            if user.id in [u.id for u in self.capt.registered_users]:
+                self.capt.registered_users = [u for u in self.capt.registered_users if u.id != user.id]
+                # Добавляем обратно в плюсы
+                if user.id not in [u.id for u in self.capt.plus_users]:
+                    self.capt.plus_users.append(user)
+        
+        await update_capt_embed(self.capt.message_id)
+        
+        users_list = "\n".join([f"• {u.mention}" for u in selected_users])
+        await interaction.response.send_message(
+            f"✅ Регистрация снята с:\n{users_list}",
+            ephemeral=True
+        )
+        
+        await send_log(
+            f"📝 **Снятие регистрации**\n"
+            f"• Капт: {self.capt.title_text}\n"
+            f"• Снял регистрацию: {interaction.user.mention}\n"
+            f"• Пользователи: {len(selected_users)} чел.",
+            color=0xffaa00,
+            title="📝 Снятие регистрации"
+        )
+
+# Класс для пагинации при регистрации
+class RegisterPaginationView(discord.ui.View):
     def __init__(self, capt, plus_users, current_page=0):
         super().__init__(timeout=120)
         self.capt = capt
@@ -465,7 +531,6 @@ class PaginationView(discord.ui.View):
         self.items_per_page = 25
         
         if not plus_users:
-            # Если нет пользователей с плюсами
             self.total_pages = 1
             members_page = []
         else:
@@ -480,7 +545,7 @@ class PaginationView(discord.ui.View):
     @discord.ui.button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=1)
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.current_page > 0:
-            new_view = PaginationView(self.capt, self.plus_users, self.current_page - 1)
+            new_view = RegisterPaginationView(self.capt, self.plus_users, self.current_page - 1)
             await interaction.response.edit_message(view=new_view)
         else:
             await interaction.response.send_message("Это первая страница", ephemeral=True)
@@ -488,7 +553,44 @@ class PaginationView(discord.ui.View):
     @discord.ui.button(label="Вперед ▶️", style=discord.ButtonStyle.secondary, row=1)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.current_page < self.total_pages - 1:
-            new_view = PaginationView(self.capt, self.plus_users, self.current_page + 1)
+            new_view = RegisterPaginationView(self.capt, self.plus_users, self.current_page + 1)
+            await interaction.response.edit_message(view=new_view)
+        else:
+            await interaction.response.send_message("Это последняя страница", ephemeral=True)
+
+# Класс для пагинации при снятии регистрации
+class UnregisterPaginationView(discord.ui.View):
+    def __init__(self, capt, registered_users, current_page=0):
+        super().__init__(timeout=120)
+        self.capt = capt
+        self.registered_users = registered_users
+        self.current_page = current_page
+        self.items_per_page = 25
+        
+        if not registered_users:
+            self.total_pages = 1
+            members_page = []
+        else:
+            self.total_pages = (len(registered_users) + self.items_per_page - 1) // self.items_per_page
+            start = self.current_page * self.items_per_page
+            end = start + self.items_per_page
+            members_page = registered_users[start:end]
+        
+        if members_page:
+            self.add_item(UnregisterSelect(capt, members_page, self.current_page + 1, self.total_pages))
+    
+    @discord.ui.button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            new_view = UnregisterPaginationView(self.capt, self.registered_users, self.current_page - 1)
+            await interaction.response.edit_message(view=new_view)
+        else:
+            await interaction.response.send_message("Это первая страница", ephemeral=True)
+    
+    @discord.ui.button(label="Вперед ▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < self.total_pages - 1:
+            new_view = UnregisterPaginationView(self.capt, self.registered_users, self.current_page + 1)
             await interaction.response.edit_message(view=new_view)
         else:
             await interaction.response.send_message("Это последняя страница", ephemeral=True)
@@ -543,7 +645,64 @@ async def register_command(interaction: discord.Interaction, сообщение_
             timestamp=datetime.now()
         )
         
-        view = PaginationView(capt, plus_users)
+        view = RegisterPaginationView(capt, plus_users)
+        
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        
+    except ValueError:
+        await interaction.response.send_message("❌ Неверный ID сообщения", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+
+@bot.tree.command(name="анрег", description="Снять регистрацию с пользователей в капте")
+@app_commands.describe(сообщение_id="ID сообщения с каптом")
+async def unregister_command(interaction: discord.Interaction, сообщение_id: str):
+    if not check_creator_role(interaction):
+        await interaction.response.send_message(
+            "❌ У вас нет прав для использования этой команды.\n"
+            f"Требуется роль: <@&{ALLOWED_CREATOR_ROLE}>", 
+            ephemeral=True
+        )
+        return
+    
+    try:
+        message_id = int(сообщение_id)
+        
+        if message_id not in active_capts:
+            await interaction.response.send_message("❌ Капт не найден или уже неактивен", ephemeral=True)
+            return
+        
+        capt = active_capts[message_id]
+        if not capt.is_active:
+            await interaction.response.send_message("❌ Срок действия капта истек", ephemeral=True)
+            return
+        
+        # Получаем только зарегистрированных пользователей и сортируем по имени
+        registered_users = sorted(capt.registered_users, key=lambda x: x.display_name)
+        
+        if not registered_users:
+            await interaction.response.send_message(
+                "❌ Нет зарегистрированных пользователей в этом капте.",
+                ephemeral=True
+            )
+            return
+        
+        # Рассчитываем количество страниц
+        items_per_page = 25
+        total_pages = (len(registered_users) + items_per_page - 1) // items_per_page
+        
+        embed = discord.Embed(
+            title="📝 Снятие регистрации",
+            description=f"**Капт:** {capt.title_text}\n\n"
+                        f"Выберите пользователей для снятия регистрации.\n"
+                        f"После снятия регистрации они вернутся в список плюсов.\n\n"
+                        f"📄 Всего зарегистрированных: {len(registered_users)}\n"
+                        f"📄 Страниц: {total_pages}",
+            color=0xffaa00,
+            timestamp=datetime.now()
+        )
+        
+        view = UnregisterPaginationView(capt, registered_users)
         
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         
@@ -649,6 +808,7 @@ async def on_interaction(interaction: discord.Interaction):
                 
                 user = interaction.user
                 
+                # Проверяем, зарегистрирован ли пользователь
                 if user.id in [u.id for u in capt.registered_users]:
                     await interaction.response.send_message("❌ Зарегистрированные игроки не могут ставить плюсы!", ephemeral=True)
                     return
@@ -694,6 +854,11 @@ async def on_interaction(interaction: discord.Interaction):
                 
                 if user.id not in [u.id for u in capt.plus_users]:
                     await interaction.response.send_message("❌ Вы не ставили плюс!", ephemeral=True)
+                    return
+                
+                # Если пользователь зарегистрирован, он не может убрать плюс
+                if user.id in [u.id for u in capt.registered_users]:
+                    await interaction.response.send_message("❌ Зарегистрированные игроки не могут убирать плюс!", ephemeral=True)
                     return
                 
                 capt.plus_users = [u for u in capt.plus_users if u.id != user.id]
