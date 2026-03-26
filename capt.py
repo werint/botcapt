@@ -11,10 +11,10 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 ALLOWED_CREATOR_ROLE = 1478205318591938671
 LOG_CHANNEL_ID = 1448991378750046209
 SCREENSHOT_WAIT_TIME = 300
+SCREENSHOT_DELETE_DELAY = 6  # Задержка перед удалением скриншота
 
 # ID ролей для отображения
 ROLE_IDS = {
-    # Основные роли (будут отображаться под ником)
     'primary_roles': [
         1400274896365420674,
         1421509117591293972,
@@ -23,7 +23,6 @@ ROLE_IDS = {
         1400276595226185870,
         1421734059259727923
     ],
-    # Вторичные роли (будут отображаться справа)
     'secondary_roles': [
         1317882573342507069,
         1383426539886084267,
@@ -98,14 +97,12 @@ def get_user_roles_info(member):
     primary_role = None
     secondary_role = None
     
-    # Ищем основную роль
     for role_id in ROLE_IDS['primary_roles']:
         role = member.get_role(role_id)
         if role:
             primary_role = role.name
             break
     
-    # Ищем вторичную роль
     for role_id in ROLE_IDS['secondary_roles']:
         role = member.get_role(role_id)
         if role:
@@ -149,22 +146,14 @@ async def update_capt_embed(message_id):
         registered_text = ""
         if capt.registered_users:
             for i, user in enumerate(capt.registered_users, 1):
-                primary_role, secondary_role = get_user_roles_info(user)
-                role_text = f"└ {primary_role}" if primary_role else "└ Нет роли"
-                if secondary_role:
-                    role_text += f" | {secondary_role}"
-                registered_text += f"{i}. {user.mention}\n{role_text}\n"
+                registered_text += f"{i}. {user.mention}\n"
         else:
             registered_text = "Нет зарегистрированных"
         
         plus_text = ""
         if capt.plus_users:
             for i, user in enumerate(capt.plus_users, 1):
-                primary_role, secondary_role = get_user_roles_info(user)
-                role_text = f"└ {primary_role}" if primary_role else "└ Нет роли"
-                if secondary_role:
-                    role_text += f" | {secondary_role}"
-                plus_text += f"{i}. {user.mention}\n{role_text}\n"
+                plus_text += f"{i}. {user.mention}\n"
         else:
             plus_text = "Нет плюсов"
         
@@ -222,22 +211,14 @@ async def send_capt_message(channel, capt):
     registered_text = ""
     if capt.registered_users:
         for i, user in enumerate(capt.registered_users, 1):
-            primary_role, secondary_role = get_user_roles_info(user)
-            role_text = f"└ {primary_role}" if primary_role else "└ Нет роли"
-            if secondary_role:
-                role_text += f" | {secondary_role}"
-            registered_text += f"{i}. {user.mention}\n{role_text}\n"
+            registered_text += f"{i}. {user.mention}\n"
     else:
         registered_text = "Нет зарегистрированных"
     
     plus_text = ""
     if capt.plus_users:
         for i, user in enumerate(capt.plus_users, 1):
-            primary_role, secondary_role = get_user_roles_info(user)
-            role_text = f"└ {primary_role}" if primary_role else "└ Нет роли"
-            if secondary_role:
-                role_text += f" | {secondary_role}"
-            plus_text += f"{i}. {user.mention}\n{role_text}\n"
+            plus_text += f"{i}. {user.mention}\n"
     else:
         plus_text = "Нет плюсов"
     
@@ -304,11 +285,12 @@ async def start_screenshot_wait(capt, interaction):
         capt.screenshot_url = screenshot_msg.attachments[0].url
         capt.screenshot_user = screenshot_msg.author
         
-        await asyncio.sleep(1)
-        await screenshot_msg.delete()
-        
-        await asyncio.sleep(0.5)
+        # Сначала отправляем финальное сообщение
         await send_capt_message(interaction.channel, capt)
+        
+        # Затем удаляем сообщение со скриншотом с задержкой
+        await asyncio.sleep(SCREENSHOT_DELETE_DELAY)
+        await screenshot_msg.delete()
         
         active_capts[capt.message_id] = capt
         
@@ -397,25 +379,25 @@ async def disable_capt(message_id):
     if message_id in active_capts:
         del active_capts[message_id]
 
-# Класс для выбора пользователей на регистрацию с пагинацией
+# Класс для выбора пользователей на регистрацию (только те, кто кинул плюс)
 class RegisterSelect(discord.ui.Select):
-    def __init__(self, capt, members_page, page_num, total_pages):
+    def __init__(self, capt, plus_users_page, page_num, total_pages):
         self.capt = capt
         self.page_num = page_num
         self.total_pages = total_pages
         options = []
         
-        for member in members_page:
+        for member in plus_users_page:
             # Определяем, зарегистрирован ли пользователь
             is_registered = member.id in [u.id for u in capt.registered_users]
             
             # Получаем роли пользователя
             primary_role, secondary_role = get_user_roles_info(member)
             
-            # Формируем описание
-            description = f"{primary_role if primary_role else 'Нет роли'}"
+            # Формируем описание с ролями
+            role_text = f"{primary_role if primary_role else 'Нет роли'}"
             if secondary_role:
-                description += f" | {secondary_role}"
+                role_text += f" | {secondary_role}"
             
             # Добавляем отметку о регистрации
             label = f"{'✅' if is_registered else '❌'} {member.display_name}"
@@ -423,7 +405,7 @@ class RegisterSelect(discord.ui.Select):
             options.append(
                 discord.SelectOption(
                     label=label[:100],
-                    description=description[:100],
+                    description=role_text[:100],
                     value=str(member.id)
                 )
             )
@@ -475,28 +457,30 @@ class RegisterSelect(discord.ui.Select):
 
 # Класс для пагинации
 class PaginationView(discord.ui.View):
-    def __init__(self, capt, all_members, current_page=0):
+    def __init__(self, capt, plus_users, current_page=0):
         super().__init__(timeout=120)
         self.capt = capt
-        self.all_members = all_members
+        self.plus_users = plus_users
         self.current_page = current_page
         self.items_per_page = 25
         
-        # Рассчитываем количество страниц
-        self.total_pages = (len(all_members) + self.items_per_page - 1) // self.items_per_page
+        if not plus_users:
+            # Если нет пользователей с плюсами
+            self.total_pages = 1
+            members_page = []
+        else:
+            self.total_pages = (len(plus_users) + self.items_per_page - 1) // self.items_per_page
+            start = self.current_page * self.items_per_page
+            end = start + self.items_per_page
+            members_page = plus_users[start:end]
         
-        # Получаем членов для текущей страницы
-        start = self.current_page * self.items_per_page
-        end = start + self.items_per_page
-        members_page = all_members[start:end]
-        
-        # Добавляем select с текущей страницей
-        self.add_item(RegisterSelect(capt, members_page, self.current_page + 1, self.total_pages))
+        if members_page:
+            self.add_item(RegisterSelect(capt, members_page, self.current_page + 1, self.total_pages))
     
     @discord.ui.button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=1)
     async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.current_page > 0:
-            new_view = PaginationView(self.capt, self.all_members, self.current_page - 1)
+            new_view = PaginationView(self.capt, self.plus_users, self.current_page - 1)
             await interaction.response.edit_message(view=new_view)
         else:
             await interaction.response.send_message("Это первая страница", ephemeral=True)
@@ -504,7 +488,7 @@ class PaginationView(discord.ui.View):
     @discord.ui.button(label="Вперед ▶️", style=discord.ButtonStyle.secondary, row=1)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.current_page < self.total_pages - 1:
-            new_view = PaginationView(self.capt, self.all_members, self.current_page + 1)
+            new_view = PaginationView(self.capt, self.plus_users, self.current_page + 1)
             await interaction.response.edit_message(view=new_view)
         else:
             await interaction.response.send_message("Это последняя страница", ephemeral=True)
@@ -532,27 +516,34 @@ async def register_command(interaction: discord.Interaction, сообщение_
             await interaction.response.send_message("❌ Срок действия капта истек", ephemeral=True)
             return
         
-        # Получаем всех участников сервера, сортируем по имени
-        guild_members = sorted([m for m in interaction.guild.members if not m.bot], key=lambda x: x.display_name)
+        # Получаем только тех, кто кинул плюс, и сортируем по имени
+        plus_users = sorted(capt.plus_users, key=lambda x: x.display_name)
+        
+        if not plus_users:
+            await interaction.response.send_message(
+                "❌ Нет пользователей, которые поставили плюс в этом капте.\n"
+                "Регистрировать можно только тех, кто поставил плюс.",
+                ephemeral=True
+            )
+            return
         
         # Рассчитываем количество страниц
         items_per_page = 25
-        total_pages = (len(guild_members) + items_per_page - 1) // items_per_page
+        total_pages = (len(plus_users) + items_per_page - 1) // items_per_page
         
         embed = discord.Embed(
             title="📝 Регистрация пользователей",
-            description=f"Выберите пользователей для регистрации в капте:\n**{capt.title_text}**\n\n"
+            description=f"**Капт:** {capt.title_text}\n\n"
+                        f"Выберите пользователей для регистрации.\n"
                         f"✅ - уже зарегистрирован\n"
                         f"❌ - не зарегистрирован\n\n"
-                        f"Под ником указана основная роль\n"
-                        f"Справа от основной роли - вторичная роль\n\n"
-                        f"📄 Всего пользователей: {len(guild_members)}\n"
+                        f"📄 Всего пользователей с плюсами: {len(plus_users)}\n"
                         f"📄 Страниц: {total_pages}",
             color=0x0099ff,
             timestamp=datetime.now()
         )
         
-        view = PaginationView(capt, guild_members)
+        view = PaginationView(capt, plus_users)
         
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         
