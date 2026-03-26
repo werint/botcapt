@@ -304,11 +304,9 @@ async def start_screenshot_wait(capt, interaction):
         capt.screenshot_url = screenshot_msg.attachments[0].url
         capt.screenshot_user = screenshot_msg.author
         
-        # Небольшая задержка перед удалением
         await asyncio.sleep(1)
         await screenshot_msg.delete()
         
-        # Небольшая задержка перед отправкой финального сообщения
         await asyncio.sleep(0.5)
         await send_capt_message(interaction.channel, capt)
         
@@ -399,14 +397,15 @@ async def disable_capt(message_id):
     if message_id in active_capts:
         del active_capts[message_id]
 
-# Класс для выбора пользователей на регистрацию
+# Класс для выбора пользователей на регистрацию с пагинацией
 class RegisterSelect(discord.ui.Select):
-    def __init__(self, capt, guild_members):
+    def __init__(self, capt, members_page, page_num, total_pages):
         self.capt = capt
+        self.page_num = page_num
+        self.total_pages = total_pages
         options = []
         
-        # Сортируем участников по имени
-        for member in sorted(guild_members, key=lambda x: x.display_name):
+        for member in members_page:
             # Определяем, зарегистрирован ли пользователь
             is_registered = member.id in [u.id for u in capt.registered_users]
             
@@ -419,7 +418,7 @@ class RegisterSelect(discord.ui.Select):
                 description += f" | {secondary_role}"
             
             # Добавляем отметку о регистрации
-            label = f"{'✅ ' if is_registered else '❌ '}{member.display_name}"
+            label = f"{'✅' if is_registered else '❌'} {member.display_name}"
             
             options.append(
                 discord.SelectOption(
@@ -430,7 +429,7 @@ class RegisterSelect(discord.ui.Select):
             )
         
         super().__init__(
-            placeholder="Выберите пользователей для регистрации",
+            placeholder=f"Страница {page_num}/{total_pages} - Выберите пользователей",
             min_values=1,
             max_values=min(25, len(options)),
             options=options
@@ -474,10 +473,41 @@ class RegisterSelect(discord.ui.Select):
             title="📝 Массовая регистрация"
         )
 
-class RegisterView(discord.ui.View):
-    def __init__(self, capt, guild_members):
+# Класс для пагинации
+class PaginationView(discord.ui.View):
+    def __init__(self, capt, all_members, current_page=0):
         super().__init__(timeout=120)
-        self.add_item(RegisterSelect(capt, guild_members))
+        self.capt = capt
+        self.all_members = all_members
+        self.current_page = current_page
+        self.items_per_page = 25
+        
+        # Рассчитываем количество страниц
+        self.total_pages = (len(all_members) + self.items_per_page - 1) // self.items_per_page
+        
+        # Получаем членов для текущей страницы
+        start = self.current_page * self.items_per_page
+        end = start + self.items_per_page
+        members_page = all_members[start:end]
+        
+        # Добавляем select с текущей страницей
+        self.add_item(RegisterSelect(capt, members_page, self.current_page + 1, self.total_pages))
+    
+    @discord.ui.button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            new_view = PaginationView(self.capt, self.all_members, self.current_page - 1)
+            await interaction.response.edit_message(view=new_view)
+        else:
+            await interaction.response.send_message("Это первая страница", ephemeral=True)
+    
+    @discord.ui.button(label="Вперед ▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < self.total_pages - 1:
+            new_view = PaginationView(self.capt, self.all_members, self.current_page + 1)
+            await interaction.response.edit_message(view=new_view)
+        else:
+            await interaction.response.send_message("Это последняя страница", ephemeral=True)
 
 @bot.tree.command(name="рег", description="Зарегистрировать пользователей в капте")
 @app_commands.describe(сообщение_id="ID сообщения с каптом")
@@ -502,8 +532,12 @@ async def register_command(interaction: discord.Interaction, сообщение_
             await interaction.response.send_message("❌ Срок действия капта истек", ephemeral=True)
             return
         
-        # Получаем всех участников сервера
-        guild_members = [m for m in interaction.guild.members if not m.bot]
+        # Получаем всех участников сервера, сортируем по имени
+        guild_members = sorted([m for m in interaction.guild.members if not m.bot], key=lambda x: x.display_name)
+        
+        # Рассчитываем количество страниц
+        items_per_page = 25
+        total_pages = (len(guild_members) + items_per_page - 1) // items_per_page
         
         embed = discord.Embed(
             title="📝 Регистрация пользователей",
@@ -511,12 +545,14 @@ async def register_command(interaction: discord.Interaction, сообщение_
                         f"✅ - уже зарегистрирован\n"
                         f"❌ - не зарегистрирован\n\n"
                         f"Под ником указана основная роль\n"
-                        f"Справа от основной роли - вторичная роль",
+                        f"Справа от основной роли - вторичная роль\n\n"
+                        f"📄 Всего пользователей: {len(guild_members)}\n"
+                        f"📄 Страниц: {total_pages}",
             color=0x0099ff,
             timestamp=datetime.now()
         )
         
-        view = RegisterView(capt, guild_members)
+        view = PaginationView(capt, guild_members)
         
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         
