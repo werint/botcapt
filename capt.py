@@ -14,8 +14,9 @@ def utcnow() -> datetime:
 # ─────────────────────────────────────────
 BOT_TOKEN       = os.environ["DISCORD_TOKEN"]
 CAPTAIN_ROLE_ID = int(os.environ.get("CAPTAIN_ROLE_ID", "1478205318591938671"))
-UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL", "60"))
-MAX_UPDATES     = int(os.environ.get("MAX_UPDATES",     "60"))
+UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL", "20"))    # секунд
+MAX_UPDATES     = int(os.environ.get("MAX_UPDATES",     "180"))   # 180 × 20с = 60 мин
+CHUNK_SIZE      = 40   # человек в одном поле embed (макс. 25 полей → 1000 человек)
 # ─────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -26,7 +27,6 @@ intents.members = True
 bot  = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# channel_id -> сессия
 sessions: dict[int, dict] = {}
 
 
@@ -37,19 +37,29 @@ def has_captain_role(member: discord.Member) -> bool:
 
 
 def make_embed(picked: list[int], update_num: int, started_at: datetime) -> discord.Embed:
-    """picked — список user_id людей, на которых капитан поставил реакцию."""
     ends_at = started_at + timedelta(seconds=UPDATE_INTERVAL * MAX_UPDATES)
 
     embed = discord.Embed(
-        title="⚔️  Список на капт",
+        title=f"⚔️  Список на капт  [{len(picked)} чел.]",
         color=0xE8B84B,
         timestamp=utcnow(),
     )
 
-    if picked:
-        embed.description = "\n".join(f"{i+1}. <@{uid}>" for i, uid in enumerate(picked))
-    else:
+    if not picked:
         embed.description = "*Никого ещё не выбрали...*"
+    else:
+        # Разбиваем на чанки по CHUNK_SIZE, каждый — отдельное поле
+        chunks = [picked[i:i + CHUNK_SIZE] for i in range(0, len(picked), CHUNK_SIZE)]
+        for idx, chunk in enumerate(chunks):
+            start_num = idx * CHUNK_SIZE + 1
+            value = "\n".join(
+                f"{start_num + j}. <@{uid}>" for j, uid in enumerate(chunk)
+            )
+            embed.add_field(
+                name=f"#{start_num}–{start_num + len(chunk) - 1}",
+                value=value,
+                inline=True,
+            )
 
     embed.set_footer(
         text=(
@@ -63,8 +73,8 @@ def make_embed(picked: list[int], update_num: int, started_at: datetime) -> disc
 async def collect_picked(channel: discord.TextChannel) -> list[int]:
     """
     Проходит по истории канала (до 500 сообщений).
-    Если под сообщением есть реакция от капитана — автор сообщения идёт в список.
-    Дублей нет. Боты не включаются.
+    Если под сообщением есть хотя бы одна реакция от капитана —
+    автор сообщения попадает в список. Дублей и ботов нет.
     """
     picked: list[int] = []
     seen: set[int] = set()
@@ -72,23 +82,22 @@ async def collect_picked(channel: discord.TextChannel) -> list[int]:
     async for msg in channel.history(limit=500):
         if not msg.reactions:
             continue
-        # Автор сообщения — не бот и ещё не в списке
         if msg.author.bot or msg.author.id in seen:
             continue
 
         for reaction in msg.reactions:
-            # Проверяем реакции под этим сообщением
+            captain_reacted = False
             async for user in reaction.users():
                 if user.bot:
                     continue
                 member = channel.guild.get_member(user.id)
                 if member and has_captain_role(member):
-                    # Капитан поставил реакцию — добавляем автора сообщения
-                    seen.add(msg.author.id)
-                    picked.append(msg.author.id)
-                    break  # один капитан нашёлся — достаточно
-            if msg.author.id in seen:
-                break  # уже добавили этого автора
+                    captain_reacted = True
+                    break
+            if captain_reacted:
+                seen.add(msg.author.id)
+                picked.append(msg.author.id)
+                break  # переходим к следующему сообщению
 
     return picked
 
@@ -123,7 +132,7 @@ async def update_loop(channel_id: int) -> None:
         except discord.HTTPException as exc:
             print(f"[!] Ошибка редактирования embed: {exc}")
 
-        print(f"[~] Канал {channel_id}: обновление {i}/{MAX_UPDATES}, выбрано {len(picked)} чел.")
+        print(f"[~] {channel_id}: обновление {i}/{MAX_UPDATES}, выбрано {len(picked)} чел.")
 
     # ── финал ──
     session["active"] = False
@@ -161,15 +170,12 @@ async def capt_command(interaction: discord.Interaction) -> None:
         )
         return
 
-    # Отвечаем сразу — без тяжёлого сбора до defer
     await interaction.response.defer()
 
     started_at = utcnow()
 
-    # Сначала отправляем пустой embed — бот не "думает"
-    message = await interaction.followup.send(
-        embed=make_embed([], 0, started_at)
-    )
+    # Моментально отправляем пустой embed
+    message = await interaction.followup.send(embed=make_embed([], 0, started_at))
 
     sessions[channel_id] = {
         "active":       True,
@@ -181,7 +187,7 @@ async def capt_command(interaction: discord.Interaction) -> None:
         "initiator_id": interaction.user.id,
     }
 
-    # Сразу делаем первый сбор и обновляем embed
+    # Первый сбор сразу после отправки
     picked = await collect_picked(interaction.channel)
     sessions[channel_id]["picked"] = picked
     try:
@@ -190,7 +196,7 @@ async def capt_command(interaction: discord.Interaction) -> None:
         pass
 
     asyncio.create_task(update_loop(channel_id))
-    print(f"[+] Сессия запущена: {interaction.channel.name} (id={channel_id}), сразу найдено: {len(picked)}")
+    print(f"[+] Сессия запущена: {interaction.channel.name} (id={channel_id}), найдено сразу: {len(picked)}")
 
 
 @tree.command(name="стоп_капт", description="Досрочно завершить список на капт")
