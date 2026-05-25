@@ -14,8 +14,8 @@ def utcnow() -> datetime:
 # ─────────────────────────────────────────
 BOT_TOKEN       = os.environ["DISCORD_TOKEN"]
 CAPTAIN_ROLE_ID = int(os.environ.get("CAPTAIN_ROLE_ID", "1478205318591938671"))
-UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL", "60"))   # секунд
-MAX_UPDATES     = int(os.environ.get("MAX_UPDATES",     "60"))    # итераций
+UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL", "60"))
+MAX_UPDATES     = int(os.environ.get("MAX_UPDATES",     "60"))
 # ─────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -36,11 +36,8 @@ def has_captain_role(member: discord.Member) -> bool:
     return any(r.id == CAPTAIN_ROLE_ID for r in member.roles)
 
 
-def make_embed(
-    reactions: dict[str, list[int]],   # emoji -> [user_id, ...]
-    update_num: int,
-    started_at: datetime,
-) -> discord.Embed:
+def make_embed(picked: list[int], update_num: int, started_at: datetime) -> discord.Embed:
+    """picked — список user_id людей, на которых капитан поставил реакцию."""
     ends_at = started_at + timedelta(seconds=UPDATE_INTERVAL * MAX_UPDATES)
 
     embed = discord.Embed(
@@ -49,12 +46,10 @@ def make_embed(
         timestamp=utcnow(),
     )
 
-    if reactions:
-        for emoji, user_ids in reactions.items():
-            mentions = "\n".join(f"• <@{uid}>" for uid in user_ids)
-            embed.add_field(name=emoji, value=mentions, inline=True)
+    if picked:
+        embed.description = "\n".join(f"{i+1}. <@{uid}>" for i, uid in enumerate(picked))
     else:
-        embed.description = "*Реакций пока нет...*"
+        embed.description = "*Никого ещё не выбрали...*"
 
     embed.set_footer(
         text=(
@@ -65,43 +60,37 @@ def make_embed(
     return embed
 
 
-async def collect_reactions(channel: discord.TextChannel, embed_msg_id: int) -> dict[str, list[int]]:
+async def collect_picked(channel: discord.TextChannel) -> list[int]:
     """
-    Сканирует ВСЕ сообщения канала (историю + embed-сообщение).
-    Возвращает словарь emoji -> [user_id, ...] только для капитанов.
-    Один человек считается только один раз (первый встреченный эмодзи игнорируется — 
-    берётся любой, но дублей нет).
+    Проходит по истории канала (до 500 сообщений).
+    Если под сообщением есть реакция от капитана — автор сообщения идёт в список.
+    Дублей нет. Боты не включаются.
     """
-    reactions_data: dict[str, list[int]] = {}
-    seen_users: set[int] = set()
+    picked: list[int] = []
+    seen: set[int] = set()
 
-    # Собираем все message_id канала (история, лимит 500 сообщений)
-    message_ids: list[int] = []
-    async for hist_msg in channel.history(limit=500):
-        if hist_msg.reactions:
-            message_ids.append(hist_msg.id)
-
-    # Убеждаемся что embed-сообщение тоже в списке
-    if embed_msg_id not in message_ids:
-        message_ids.append(embed_msg_id)
-
-    for mid in message_ids:
-        try:
-            msg = await channel.fetch_message(mid)
-        except discord.NotFound:
+    async for msg in channel.history(limit=500):
+        if not msg.reactions:
+            continue
+        # Автор сообщения — не бот и ещё не в списке
+        if msg.author.bot or msg.author.id in seen:
             continue
 
         for reaction in msg.reactions:
-            emoji_str = str(reaction.emoji)
+            # Проверяем реакции под этим сообщением
             async for user in reaction.users():
-                if user.bot or user.id in seen_users:
+                if user.bot:
                     continue
                 member = channel.guild.get_member(user.id)
                 if member and has_captain_role(member):
-                    seen_users.add(user.id)
-                    reactions_data.setdefault(emoji_str, []).append(user.id)
+                    # Капитан поставил реакцию — добавляем автора сообщения
+                    seen.add(msg.author.id)
+                    picked.append(msg.author.id)
+                    break  # один капитан нашёлся — достаточно
+            if msg.author.id in seen:
+                break  # уже добавили этого автора
 
-    return reactions_data
+    return picked
 
 
 # ── update loop ───────────────────────────
@@ -117,7 +106,6 @@ async def update_loop(channel_id: int) -> None:
 
         session["update_count"] = i
 
-        # Проверяем, что embed-сообщение ещё живо
         try:
             embed_msg: discord.Message = await session["channel"].fetch_message(
                 session["message"].id
@@ -127,21 +115,21 @@ async def update_loop(channel_id: int) -> None:
             session["active"] = False
             break
 
-        reactions_data = await collect_reactions(session["channel"], embed_msg.id)
-        session["reactions"] = reactions_data
+        picked = await collect_picked(session["channel"])
+        session["picked"] = picked
 
         try:
-            await embed_msg.edit(embed=make_embed(reactions_data, i, session["started_at"]))
+            await embed_msg.edit(embed=make_embed(picked, i, session["started_at"]))
         except discord.HTTPException as exc:
             print(f"[!] Ошибка редактирования embed: {exc}")
 
-        print(f"[~] Канал {channel_id}: обновление {i}/{MAX_UPDATES}, найдено {sum(len(v) for v in reactions_data.values())} реакций капитанов")
+        print(f"[~] Канал {channel_id}: обновление {i}/{MAX_UPDATES}, выбрано {len(picked)} чел.")
 
-    # ── финальное обновление ──
+    # ── финал ──
     session["active"] = False
     try:
         embed_msg = await session["channel"].fetch_message(session["message"].id)
-        final = make_embed(session["reactions"], MAX_UPDATES, session["started_at"])
+        final = make_embed(session["picked"], MAX_UPDATES, session["started_at"])
         final.title = "✅  Список на капт  —  Завершён"
         final.color = 0x57F287
         final.set_footer(text="Сбор завершён")
@@ -173,29 +161,36 @@ async def capt_command(interaction: discord.Interaction) -> None:
         )
         return
 
+    # Отвечаем сразу — без тяжёлого сбора до defer
     await interaction.response.defer()
 
     started_at = utcnow()
 
-    # Первый сбор — уже до команды (история канала)
-    channel = interaction.channel
-    initial_reactions = await collect_reactions(channel, 0)  # 0 — embed ещё не создан
-
-    embed = make_embed(initial_reactions, 0, started_at)
-    message = await interaction.followup.send(embed=embed)
+    # Сначала отправляем пустой embed — бот не "думает"
+    message = await interaction.followup.send(
+        embed=make_embed([], 0, started_at)
+    )
 
     sessions[channel_id] = {
         "active":       True,
         "message":      message,
-        "channel":      channel,
-        "reactions":    initial_reactions,
+        "channel":      interaction.channel,
+        "picked":       [],
         "update_count": 0,
         "started_at":   started_at,
         "initiator_id": interaction.user.id,
     }
 
+    # Сразу делаем первый сбор и обновляем embed
+    picked = await collect_picked(interaction.channel)
+    sessions[channel_id]["picked"] = picked
+    try:
+        await message.edit(embed=make_embed(picked, 0, started_at))
+    except discord.HTTPException:
+        pass
+
     asyncio.create_task(update_loop(channel_id))
-    print(f"[+] Сессия запущена: канал {channel.name} (id={channel_id}), начальных реакций: {sum(len(v) for v in initial_reactions.values())}")
+    print(f"[+] Сессия запущена: {interaction.channel.name} (id={channel_id}), сразу найдено: {len(picked)}")
 
 
 @tree.command(name="стоп_капт", description="Досрочно завершить список на капт")
