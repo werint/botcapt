@@ -39,7 +39,7 @@ def has_captain_role(member: discord.Member) -> bool:
 def make_embed(picked: list[int], update_num: int, started_at: datetime) -> discord.Embed:
     ends_at = started_at + timedelta(seconds=UPDATE_INTERVAL * MAX_UPDATES)
     embed = discord.Embed(
-        title=f"⚔️  Список на капт  [{len(picked)} чел.]",
+        title=f"⚔️  Список  [{len(picked)} чел.]",
         color=0xE8B84B,
         timestamp=utcnow(),
     )
