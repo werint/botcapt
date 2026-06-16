@@ -17,6 +17,20 @@ CAPTAIN_ROLE_ID = int(os.environ.get("CAPTAIN_ROLE_ID", "1478205318591938671"))
 UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL", "20"))   # секунд
 MAX_UPDATES     = int(os.environ.get("MAX_UPDATES",     "180"))  # 180 × 20с = 60 мин
 CHUNK_SIZE      = 40  # человек в одном поле embed
+
+# Иерархия ролей: первая — высший приоритет, последняя — низший.
+# Участники без этих ролей идут в самый конец.
+ROLE_HIERARCHY: list[int] = [
+    1223589384452833290,  # 0 — высший приоритет
+    1310673963000528949,  # 1
+    1381682246678741022,  # 2
+    1400274896365420674,  # 3
+    1421509117591293972,  # 4
+    1400274302686986271,  # 5
+    1421509201498476726,  # 6
+    1400276595226185870,  # 7
+    1317882573342507069,  # 8 — низший приоритет
+]
 # ─────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -36,17 +50,54 @@ def has_captain_role(member: discord.Member) -> bool:
     return any(r.id == CAPTAIN_ROLE_ID for r in member.roles)
 
 
-def make_embed(picked: list[int], update_num: int, started_at: datetime) -> discord.Embed:
+def get_role_priority(member: discord.Member) -> int:
+    """
+    Возвращает приоритет участника по иерархии ролей.
+    Меньше число — выше в списке.
+    Если нет ни одной роли из иерархии — возвращает len(ROLE_HIERARCHY) (самый низ).
+    """
+    member_role_ids = {r.id for r in member.roles}
+    for priority, role_id in enumerate(ROLE_HIERARCHY):
+        if role_id in member_role_ids:
+            return priority
+    return len(ROLE_HIERARCHY)
+
+
+def sort_picked(picked: list[int], guild: discord.Guild) -> list[int]:
+    """
+    Сортирует список участников по иерархии ролей.
+    Внутри одного приоритета — сохраняется исходный порядок (время реакции).
+    """
+    def key(uid: int):
+        member = guild.get_member(uid)
+        if not member:
+            return len(ROLE_HIERARCHY)
+        return get_role_priority(member)
+
+    # stable sort: порядок элементов с одинаковым ключом сохраняется
+    return sorted(picked, key=key)
+
+
+def make_embed(
+    picked: list[int],
+    update_num: int,
+    started_at: datetime,
+    guild: discord.Guild | None = None,
+) -> discord.Embed:
     ends_at = started_at + timedelta(seconds=UPDATE_INTERVAL * MAX_UPDATES)
     embed = discord.Embed(
         title=f"⚔️  Список  [{len(picked)} чел.]",
         color=0xE8B84B,
         timestamp=utcnow(),
     )
-    if not picked:
+
+    # Сортируем перед отображением
+    display_list = sort_picked(picked, guild) if guild else picked
+
+    if not display_list:
         embed.description = "*Никого ещё не выбрали...*"
     else:
-        chunks = [picked[i:i + CHUNK_SIZE] for i in range(0, len(picked), CHUNK_SIZE)]
+        chunks = [display_list[i:i + CHUNK_SIZE] for i in range(0, len(display_list), CHUNK_SIZE)]
         for idx, chunk in enumerate(chunks):
             start_num = idx * CHUNK_SIZE + 1
             embed.add_field(
@@ -54,6 +105,7 @@ def make_embed(picked: list[int], update_num: int, started_at: datetime) -> disc
                 value="\n".join(f"{start_num + j}. <@{uid}>" for j, uid in enumerate(chunk)),
                 inline=True,
             )
+
     embed.set_footer(
         text=f"Обновление {update_num}/{MAX_UPDATES}  •  Завершится в {ends_at.strftime('%H:%M')} UTC"
     )
@@ -69,7 +121,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if channel_id not in sessions or not sessions[channel_id]["active"]:
         return
 
-    # Проверяем роль реагирующего
     guild = bot.get_guild(payload.guild_id)
     if not guild:
         return
@@ -77,7 +128,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if not member or not has_captain_role(member):
         return
 
-    # Получаем автора сообщения
     channel = bot.get_channel(channel_id)
     try:
         msg = await channel.fetch_message(payload.message_id)
@@ -97,7 +147,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
-    """Капитан убрал реакцию — проверяем, остались ли другие реакции капитанов под этим сообщением."""
+    """Капитан убрал реакцию — проверяем, остались ли другие реакции капитанов."""
     channel_id = payload.channel_id
     if channel_id not in sessions or not sessions[channel_id]["active"]:
         return
@@ -190,7 +240,9 @@ async def update_loop(channel_id: int) -> None:
             break
 
         try:
-            await embed_msg.edit(embed=make_embed(session["picked"], i, session["started_at"]))
+            await embed_msg.edit(
+                embed=make_embed(session["picked"], i, session["started_at"], session["guild"])
+            )
         except discord.HTTPException as exc:
             print(f"[!] Ошибка редактирования embed: {exc}")
 
@@ -200,7 +252,7 @@ async def update_loop(channel_id: int) -> None:
     session["active"] = False
     try:
         embed_msg = await session["channel"].fetch_message(session["message"].id)
-        final = make_embed(session["picked"], MAX_UPDATES, session["started_at"])
+        final = make_embed(session["picked"], MAX_UPDATES, session["started_at"], session["guild"])
         final.title = "✅  Список на капт  —  Завершён"
         final.color = 0x57F287
         final.set_footer(text="Сбор завершён")
@@ -233,8 +285,9 @@ async def capt_command(interaction: discord.Interaction) -> None:
 
     await interaction.response.defer()
 
+    guild = interaction.guild
     started_at = utcnow()
-    message = await interaction.followup.send(embed=make_embed([], 0, started_at))
+    message = await interaction.followup.send(embed=make_embed([], 0, started_at, guild))
 
     # Сканируем историю один раз
     picked, picked_set = await initial_scan(interaction.channel)
@@ -243,8 +296,9 @@ async def capt_command(interaction: discord.Interaction) -> None:
         "active":       True,
         "message":      message,
         "channel":      interaction.channel,
-        "picked":       picked,        # список (порядок важен)
-        "picked_set":   picked_set,    # множество для быстрой проверки дублей
+        "guild":        guild,
+        "picked":       picked,
+        "picked_set":   picked_set,
         "update_count": 0,
         "started_at":   started_at,
         "initiator_id": interaction.user.id,
@@ -252,12 +306,15 @@ async def capt_command(interaction: discord.Interaction) -> None:
 
     # Обновляем embed с результатами начального скана
     try:
-        await message.edit(embed=make_embed(picked, 0, started_at))
+        await message.edit(embed=make_embed(picked, 0, started_at, guild))
     except discord.HTTPException:
         pass
 
     asyncio.create_task(update_loop(channel_id))
-    print(f"[+] Сессия запущена: {interaction.channel.name} (id={channel_id}), начальный скан: {len(picked)} чел.")
+    print(
+        f"[+] Сессия запущена: {interaction.channel.name} (id={channel_id}), "
+        f"начальный скан: {len(picked)} чел."
+    )
 
 
 @tree.command(name="стоп_капт", description="Досрочно завершить список на капт")
@@ -288,6 +345,7 @@ async def on_ready() -> None:
     print(f"[✓] Бот запущен: {bot.user}  (id={bot.user.id})")
     print(f"    CAPTAIN_ROLE_ID : {CAPTAIN_ROLE_ID}")
     print(f"    Интервал        : {UPDATE_INTERVAL}с × {MAX_UPDATES} = {UPDATE_INTERVAL * MAX_UPDATES // 60} мин")
+    print(f"    Иерархия ролей  : {len(ROLE_HIERARCHY)} уровней")
 
 
 bot.run(BOT_TOKEN)
